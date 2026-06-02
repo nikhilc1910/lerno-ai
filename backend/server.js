@@ -763,44 +763,74 @@ Guidelines for SVG:
 
 Return ONLY the raw SVG code.`;
 
-  try {
-    const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
-      {
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.2,
-          maxOutputTokens: 3000,
+  // Use gemini-2.0-flash-lite for SVG — non-thinking model with higher rate limits
+  // and doesn't waste tokens on internal reasoning
+  const svgModel = "gemini-2.0-flash-lite";
+  const maxRetries = 2;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      console.log(`[SVG GEN] Attempt ${attempt + 1}/${maxRetries + 1} for scene "${title}" using ${svgModel}...`);
+      const response = await axios.post(
+        `https://generativelanguage.googleapis.com/v1beta/models/${svgModel}:generateContent?key=${apiKey}`,
+        {
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.3,
+            maxOutputTokens: 8192,
+          },
         },
-      },
-      { headers: { "Content-Type": "application/json" } }
-    );
-    
-    let rawText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    rawText = rawText.replace(/^```(?:xml|svg|html)?\n/, "").replace(/\n```$/, "").trim();
-    
-    if (rawText.includes("<svg") && rawText.includes("</svg>")) {
-      const startIdx = rawText.indexOf("<svg");
-      const endIdx = rawText.lastIndexOf("</svg>") + 6;
-      const svg = rawText.slice(startIdx, endIdx);
-      console.log(`[SVG GEN] Gemini successfully returned SVG for scene "${title}". Length: ${svg.length} characters.`);
-      const base64Svg = Buffer.from(svg).toString("base64");
-      return `data:image/svg+xml;base64,${base64Svg}`;
-    } else {
-      console.warn(`[SVG GEN] Gemini returned text for scene "${title}" but no valid SVG tag was found.`);
+        { headers: { "Content-Type": "application/json" }, timeout: 30000 }
+      );
+      
+      let rawText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      console.log(`[SVG GEN] Raw response length for "${title}": ${rawText.length} chars`);
+      
+      // Strip markdown fences if present
+      rawText = rawText.replace(/^```(?:xml|svg|html)?\s*\n?/, "").replace(/\n?```\s*$/, "").trim();
+      
+      if (rawText.includes("<svg") && rawText.includes("</svg>")) {
+        const startIdx = rawText.indexOf("<svg");
+        const endIdx = rawText.lastIndexOf("</svg>") + 6;
+        const svg = rawText.slice(startIdx, endIdx);
+        console.log(`[SVG GEN] ✅ Gemini successfully returned SVG for scene "${title}". Length: ${svg.length} characters.`);
+        const base64Svg = Buffer.from(svg).toString("base64");
+        return `data:image/svg+xml;base64,${base64Svg}`;
+      } else {
+        console.warn(`[SVG GEN] ⚠ Gemini returned text for scene "${title}" but no valid SVG tag was found. Response preview: ${rawText.substring(0, 200)}`);
+      }
+    } catch (error) {
+      const status = error.response?.status;
+      const retryAfter = error.response?.data?.error?.details?.find(d => d.retryDelay)?.retryDelay;
+      console.error(`[SVG GEN] ❌ Attempt ${attempt + 1} failed for scene "${title}": status=${status}, message=${error.response?.data?.error?.message || error.message}`);
+      
+      // Retry on rate limit (429) with backoff
+      if (status === 429 && attempt < maxRetries) {
+        const waitMs = retryAfter ? parseInt(retryAfter) * 1000 : (attempt + 1) * 5000;
+        console.log(`[SVG GEN] Rate limited. Waiting ${waitMs}ms before retry...`);
+        await new Promise(resolve => setTimeout(resolve, waitMs));
+        continue;
+      }
     }
-  } catch (error) {
-    console.error(`[SVG GEN] Failed to generate SVG for scene "${title}":`, error.response ? error.response.data : error.message);
   }
 
-  // Fallback SVG
+  // Fallback SVG — always returns a valid base64 SVG data URL
   const fallbackSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" width="100%" height="100%">
-    <rect width="800" height="450" fill="#0B0F19"/>
-    <circle cx="400" cy="225" r="80" fill="none" stroke="#6366F1" stroke-width="4" stroke-dasharray="8 4"/>
-    <text x="400" y="225" font-family="system-ui, sans-serif" font-size="24" fill="#FFFFFF" text-anchor="middle" dominant-baseline="middle">${title}</text>
-    <text x="400" y="270" font-family="system-ui, sans-serif" font-size="14" fill="#9CA3AF" text-anchor="middle" dominant-baseline="middle">Visual illustration placeholder</text>
+    <defs>
+      <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+        <stop offset="0%" style="stop-color:#0B0F19"/>
+        <stop offset="100%" style="stop-color:#1a1f36"/>
+      </linearGradient>
+    </defs>
+    <rect width="800" height="450" fill="url(#bg)"/>
+    <circle cx="400" cy="180" r="60" fill="none" stroke="#6366F1" stroke-width="3" stroke-dasharray="8 4" opacity="0.6"/>
+    <circle cx="400" cy="180" r="40" fill="none" stroke="#8B5CF6" stroke-width="2" opacity="0.4"/>
+    <text x="400" y="185" font-family="system-ui, sans-serif" font-size="22" fill="#FFFFFF" text-anchor="middle" dominant-baseline="middle" font-weight="bold">${title}</text>
+    <line x1="200" y1="280" x2="600" y2="280" stroke="#6366F1" stroke-width="1" opacity="0.3"/>
+    <text x="400" y="310" font-family="system-ui, sans-serif" font-size="14" fill="#9CA3AF" text-anchor="middle" dominant-baseline="middle">Educational visual for: ${topic}</text>
+    <text x="400" y="340" font-family="system-ui, sans-serif" font-size="12" fill="#6B7280" text-anchor="middle" dominant-baseline="middle">Diagram will be generated when API quota resets</text>
   </svg>`;
-  console.log(`[SVG GEN] Using fallback base64 SVG for scene "${title}". Length: ${fallbackSvg.length} characters.`);
+  console.log(`[SVG GEN] 🔄 Using fallback SVG for scene "${title}". Length: ${fallbackSvg.length} characters.`);
   return `data:image/svg+xml;base64,${Buffer.from(fallbackSvg).toString("base64")}`;
 }
 
@@ -906,20 +936,24 @@ Return ONLY valid JSON — no markdown fences, no explanation, nothing else:
       return res.status(500).json({ error: "Gemini returned empty scenes array" });
     }
 
-    // Generate SVG visuals for all scenes in parallel
-    const scenesWithVisuals = await Promise.all(
-      scenes.map(async (scene) => {
-        const title = scene.title || `Scene ${scene.scene_number}`;
-        const description = scene.animation_description || scene["animation-description"] || "";
-        const narration = scene.narration || "";
-        const imageUrl = await generateSvgVisualForScene(apiKey, title, description, narration, topic);
-        console.log(`[SCENE VERIFICATION] Scene ${scene.scene_number || 'unknown'}: image_url exists? ${!!imageUrl}`);
-        return {
-          ...scene,
-          image_url: imageUrl
-        };
-      })
-    );
+    // Generate SVG visuals for all scenes SEQUENTIALLY to avoid burst rate limits
+    console.log(`[SVG PIPELINE] Starting sequential SVG generation for ${scenes.length} scenes...`);
+    const scenesWithVisuals = [];
+    for (const scene of scenes) {
+      const title = scene.title || `Scene ${scene.scene_number}`;
+      const description = scene.animation_description || scene["animation-description"] || "";
+      const narration = scene.narration || "";
+      const imageUrl = await generateSvgVisualForScene(apiKey, title, description, narration, topic);
+      console.log(`[SCENE VERIFICATION] Scene ${scene.scene_number || 'unknown'}: image_url exists=${!!imageUrl}, length=${imageUrl?.length || 0}, starts_with="${imageUrl?.substring(0, 30)}"`);
+      scenesWithVisuals.push({
+        ...scene,
+        image_url: imageUrl
+      });
+      // Small delay between scenes to respect rate limits
+      if (scenes.indexOf(scene) < scenes.length - 1) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
 
     console.log(`Gemini lesson generated for topic "${topic}" — ${scenesWithVisuals.length} scenes with vector visuals`);
     console.log(`[API RESPONSE DIAGNOSTIC] Full slides/scenes array to be sent:\n`, JSON.stringify(scenesWithVisuals, null, 2));

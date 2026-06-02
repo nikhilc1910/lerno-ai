@@ -17,7 +17,7 @@ export const getAccessToken = () => accessToken;
 // Create axios instance pointing to Express gateway /api/ prefix
 export const apiClient = axios.create({
   baseURL: "",
-  timeout: 60000, // 60 seconds timeout
+  timeout: 120000, // 120 seconds timeout — accommodates sequential SVG generation
   headers: {
     "Content-Type": "application/json",
   },

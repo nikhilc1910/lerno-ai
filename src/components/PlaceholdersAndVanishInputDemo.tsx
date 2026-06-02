@@ -88,6 +88,10 @@ export default function PlaceholdersAndVanishInputDemo() {
         const scenes = geminiData.scenes || [];
 
         if (scenes.length > 0) {
+          console.log("[VISUAL PIPELINE] Scenes being passed to LearningPage:");
+          scenes.forEach((s: any, i: number) => {
+            console.log(`  Scene ${i}: title="${s.title}", image_url=${s.image_url ? 'YES (' + s.image_url.substring(0, 60) + '...)' : 'MISSING'}, keys=[${Object.keys(s).join(',')}]`);
+          });
           navigate("/learning", {
             state: {
               query: inputValue,
