@@ -173,7 +173,7 @@ app.use(globalLimiter);
 // Strict Rate Limiters
 const lessonLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,  // 10 minute window
-  max: 3,                    // max 3 lesson generations per 10 min
+  max: 100,                  // Relaxed for development testing
   keyGenerator: (req) => req.user?.uid || req.ip,  // per-user, not per-IP
   store: new CustomRedisStore("rl:lesson", 10 * 60 * 1000),
   message: { error: 'Lesson generation limit reached. Wait a few minutes.' }
@@ -181,7 +181,7 @@ const lessonLimiter = rateLimit({
 
 const callLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,  // 1 hour window
-  max: 2,                    // max 2 calls per hour per user
+  max: 100,                  // Relaxed for development testing
   keyGenerator: (req) => req.user?.uid || req.ip,
   store: new CustomRedisStore("rl:call", 60 * 60 * 1000),
   message: { error: 'Call limit reached. Try again in an hour.' }
