@@ -8,9 +8,9 @@ This document describes the high-level architecture, system departments, data fl
 
 Lerno.ai is split into a **three-tier architecture**:
 
-1. **Client Tier** — React/TypeScript SPA with behavioral telemetry collection
-2. **Gateway Tier** — Node.js/Express API handling authentication, sessions, and request proxying
-3. **ML Engine Tier** — Python/FastAPI backend for AI lesson generation, video rendering, and cognitive analysis
+1. **Client Tier** — React/TypeScript SPA with behavioral telemetry collection, WebSocket status listener, and visual slide carousel
+2. **Gateway Tier** — Node.js/Express API serving as WebSocket gateway, handling authentication, sessions, and request proxying
+3. **ML Engine Tier** — Python/FastAPI backend for AI lesson content generation, Gemini-powered educational SVG visuals, and cognitive analysis
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -20,7 +20,7 @@ Lerno.ai is split into a **three-tier architecture**:
 │                    │                             │
 │          BehavioralTracker (telemetry)            │
 └─────────────────────┬────────────────────────────┘
-                      │ HTTPS / Axios
+                      │ HTTPS / WebSockets
           ┌───────────┼───────────┐
           ▼                       ▼
 ┌──────────────────┐   ┌──────────────────────┐
@@ -28,7 +28,7 @@ Lerno.ai is split into a **three-tier architecture**:
 │  :3001           │   │   :8000               │
 │                  │   │                       │
 │  • Firebase Auth │   │  • LangChain agents   │
-│  • JWT sessions  │   │  • Manim rendering    │
+│  • JWT sessions  │   │  • Gemini SVG visuals │
 │  • Rate limiting │   │  • ElevenLabs TTS     │
 │  • CORS / Helmet │   │  • Telemetry ingest   │
 └──────┬───────────┘   └───────┬──────────────┘
@@ -36,9 +36,9 @@ Lerno.ai is split into a **three-tier architecture**:
        ▼                       ▼
 ┌────────────┐  ┌────────┐  ┌────────────┐
 │  Firebase  │  │ SQLite │  │ AI APIs    │
-│  Auth      │  │ (dev)  │  │ Claude 3.7 │
-│  Storage   │  │ Pg     │  │ Gemini 2.0 │
-│  Firestore │  │ (prod) │  │ ElevenLabs │
+│  Auth      │  │ (dev)  │  │ Gemini 2.5 │
+│  Storage   │  │ Pg     │  │ ElevenLabs │
+│  Firestore │  │ (prod) │  │            │
 └────────────┘  └────────┘  └────────────┘
 ```
 
@@ -56,10 +56,10 @@ Lerno.ai is split into a **three-tier architecture**:
 - **Signals tracked:** Click frequency, dwell time, scroll velocity, response latency, interaction patterns
 - **Output:** Per-user cognitive profile stored in SQLite/PostgreSQL with normalized behavioral vectors
 
-### 3. AI Content Generation
-- **Tech:** LangChain (Anthropic + Google GenAI), Manim, ElevenLabs SDK
-- **Flow:** User query → LLM generates Manim Python script → server compiles to MP4 → uploads to Firebase Storage → streams to client
-- **Fallback:** If Manim compilation fails after 3 retries, serves a static explanation card
+### 3. AI Content Generation & Visuals
+- **Tech:** LangChain (Google GenAI), Gemini API, ElevenLabs SDK
+- **Flow:** User query → LLM generates storyboard, narration scripts, and quiz questions → Gemini generates raw educational SVG vector graphics per scene → uploads to Supabase Storage → broadcasts progress in real-time via WebSockets → client renders visual carousel
+- **Fallback:** If Supabase Storage upload fails, SVGs are returned as inline base64 Data URLs directly in the JSON response payload, ensuring zero downtime
 
 ### 4. Narration Pipeline
 - **Tech:** ElevenLabs API via `narration_service.py`
@@ -83,24 +83,26 @@ Lerno.ai is split into a **three-tier architecture**:
 User Input (topic)
     │
     ▼
-Express Gateway ──► FastAPI /generate-lesson
+Express Gateway ──► FastAPI /process-data
                         │
-                        ├──► Claude: Generate Manim script
+                        ├──► Gemini: Generate Storyboard frames
                         │       │
+                        │       ├──► Broadcast: `content_generated`
                         │       ▼
-                        ├──► Validate & compile Manim → MP4
+                        ├──► Gemini: Generate narration & quiz questions
                         │       │
+                        │       ├──► Broadcast: `quiz_generated`
                         │       ▼
-                        ├──► ElevenLabs: Generate narration → MP3
+                        ├──► Gemini: Generate SVG diagrams & illustrations
                         │       │
+                        │       ├──► Upload to Supabase Storage (or base64 fallback)
+                        │       ├──► Broadcast: `images_generated`
                         │       ▼
-                        └──► Upload to Firebase Storage
+                        └──► Save final lesson payload and return
                                 │
+                                ├──► Broadcast: `lesson_ready`
                                 ▼
-                        Return signed URLs to client
-                                │
-                                ▼
-                        Client renders video + synced audio
+                        Client renders SVG slide carousel + narration audio
 ```
 
 ### Authentication Flow

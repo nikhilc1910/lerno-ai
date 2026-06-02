@@ -3,6 +3,8 @@ import axios from "axios";
 import cors from "cors";
 import dotenv from "dotenv";
 import path from "path";
+import http from "http";
+import { WebSocketServer } from "ws";
 import { fileURLToPath } from "url";
 import admin from "firebase-admin";
 import { readFileSync } from "fs";
@@ -18,6 +20,9 @@ const __dirname = path.dirname(__filename);
 // Load env files from both root and backend directory for max compatibility
 dotenv.config({ path: path.join(__dirname, "../.env") });
 dotenv.config({ path: path.join(__dirname, ".env") });
+
+// Map to store active websockets by jobId
+const activeSockets = new Map();
 
 // Define PII Scrubbing patterns
 const EMAIL_REGEX = /[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+/g;
@@ -416,6 +421,30 @@ app.delete("/api/parent/child-data", requireAuth, async (req, res) => {
   }
 });
 
+// Internal Endpoint for FastAPI progress broadcasts
+app.post("/internal/job-update", async (req, res) => {
+  const { job_id, status, progress, message, data } = req.body ?? {};
+  if (!job_id) {
+    return res.status(400).json({ error: "job_id is required" });
+  }
+
+  try {
+    const clientSet = activeSockets.get(job_id);
+    if (clientSet && clientSet.size > 0) {
+      const payload = JSON.stringify({ job_id, status, progress, message, data });
+      for (const ws of clientSet) {
+        if (ws.readyState === 1) { // 1 = OPEN
+          ws.send(payload);
+        }
+      }
+    }
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("Error broadcasting job-update:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
 // Proxy for FastAPI process-data
 app.post("/api/input-data",
   requireAuth,
@@ -707,6 +736,74 @@ app.post("/api/gemini-chat", async (req, res) => {
   }
 });
 
+async function generateSvgVisualForScene(apiKey, title, description, narration, topic) {
+  const prompt = `You are a professional educational graphic designer and front-end developer. Generate a beautiful, modern, and high-quality educational SVG diagram or illustration to visualize the concept: "${title}".
+
+Context/Description of this scene:
+"${description}"
+
+Narration script:
+"${narration}"
+
+Overall lesson topic:
+"${topic}"
+
+Guidelines for SVG:
+1. It must be a complete, valid, self-contained SVG string starting with <svg> and ending with </svg>.
+2. Do NOT use markdown fences or code block formatting (e.g. no \`\`\`xml or \`\`\`svg). Return ONLY the raw SVG code.
+3. SVG dimensions should be viewBox="0 0 800 450" (16:9 aspect ratio) for standard horizontal slideshow display.
+4. Use rich, premium educational design aesthetics:
+   - Deep, elegant dark background (e.g., #0B0F19 or #121827) so it fits with the platform's sleek dark theme.
+   - Harmonic, tailored color palette (e.g., violet/indigo #6366F1, emerald green #10B981, amber yellow #F59E0B, sky blue #38BDF8, crimson red #EF4444).
+   - High-quality modern typography for labels and formulas. Use clean sans-serif system fonts (e.g., font-family="system-ui, -apple-system, sans-serif") or monospaced for numbers, with appropriate font sizes (20px to 32px for titles, 14px to 18px for labels) and high contrast.
+   - Include crisp vector graphics: use lines, dashed lines, circles, polygons, curves, grid coordinate lines, and custom marker arrows to create diagrams, labeled illustrations, concept maps, formula breakdowns, or process flowcharts.
+   - Group related elements using <g> and position them carefully to avoid any overlap.
+   - Do NOT use external images or load external fonts. All graphics must be drawn with native SVG elements.
+5. Create a visual that directly and beautifully explains the concept.
+
+Return ONLY the raw SVG code.`;
+
+  try {
+    const response = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
+      {
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: 0.2,
+          maxOutputTokens: 3000,
+        },
+      },
+      { headers: { "Content-Type": "application/json" } }
+    );
+    
+    let rawText = response.data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    rawText = rawText.replace(/^```(?:xml|svg|html)?\n/, "").replace(/\n```$/, "").trim();
+    
+    if (rawText.includes("<svg") && rawText.includes("</svg>")) {
+      const startIdx = rawText.indexOf("<svg");
+      const endIdx = rawText.lastIndexOf("</svg>") + 6;
+      const svg = rawText.slice(startIdx, endIdx);
+      console.log(`[SVG GEN] Gemini successfully returned SVG for scene "${title}". Length: ${svg.length} characters.`);
+      const base64Svg = Buffer.from(svg).toString("base64");
+      return `data:image/svg+xml;base64,${base64Svg}`;
+    } else {
+      console.warn(`[SVG GEN] Gemini returned text for scene "${title}" but no valid SVG tag was found.`);
+    }
+  } catch (error) {
+    console.error(`[SVG GEN] Failed to generate SVG for scene "${title}":`, error.response ? error.response.data : error.message);
+  }
+
+  // Fallback SVG
+  const fallbackSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" width="100%" height="100%">
+    <rect width="800" height="450" fill="#0B0F19"/>
+    <circle cx="400" cy="225" r="80" fill="none" stroke="#6366F1" stroke-width="4" stroke-dasharray="8 4"/>
+    <text x="400" y="225" font-family="system-ui, sans-serif" font-size="24" fill="#FFFFFF" text-anchor="middle" dominant-baseline="middle">${title}</text>
+    <text x="400" y="270" font-family="system-ui, sans-serif" font-size="14" fill="#9CA3AF" text-anchor="middle" dominant-baseline="middle">Visual illustration placeholder</text>
+  </svg>`;
+  console.log(`[SVG GEN] Using fallback base64 SVG for scene "${title}". Length: ${fallbackSvg.length} characters.`);
+  return `data:image/svg+xml;base64,${Buffer.from(fallbackSvg).toString("base64")}`;
+}
+
 // ── Gemini-powered instant lesson generation (no Manim, results in seconds) ──
 app.post("/api/generate-lesson-gemini", requireAuth, lessonLimiter, validateLessonBody, async (req, res) => {
   const { topic } = req.body;
@@ -809,11 +906,27 @@ Return ONLY valid JSON — no markdown fences, no explanation, nothing else:
       return res.status(500).json({ error: "Gemini returned empty scenes array" });
     }
 
-    console.log(`Gemini lesson generated for topic "${topic}" — ${scenes.length} scenes`);
+    // Generate SVG visuals for all scenes in parallel
+    const scenesWithVisuals = await Promise.all(
+      scenes.map(async (scene) => {
+        const title = scene.title || `Scene ${scene.scene_number}`;
+        const description = scene.animation_description || scene["animation-description"] || "";
+        const narration = scene.narration || "";
+        const imageUrl = await generateSvgVisualForScene(apiKey, title, description, narration, topic);
+        console.log(`[SCENE VERIFICATION] Scene ${scene.scene_number || 'unknown'}: image_url exists? ${!!imageUrl}`);
+        return {
+          ...scene,
+          image_url: imageUrl
+        };
+      })
+    );
+
+    console.log(`Gemini lesson generated for topic "${topic}" — ${scenesWithVisuals.length} scenes with vector visuals`);
+    console.log(`[API RESPONSE DIAGNOSTIC] Full slides/scenes array to be sent:\n`, JSON.stringify(scenesWithVisuals, null, 2));
     res.json({
       success: true,
       metadata: parsed.metadata || { topic, audience: "student" },
-      scenes,
+      scenes: scenesWithVisuals,
     });
   } catch (error) {
     console.error("Gemini lesson generation error:", error.message);
@@ -1236,7 +1349,39 @@ app.post("/api/multiplayer/boss-rewards", requireAuth, async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3001;
-app.listen(PORT, () => {
+const server = http.createServer(app);
+const wss = new WebSocketServer({ noServer: true });
+
+server.on("upgrade", (request, socket, head) => {
+  const urlObj = new URL(request.url, `http://${request.headers.host || 'localhost'}`);
+  const match = urlObj.pathname.match(/^\/ws\/generation\/([^/]+)$/);
+  
+  if (match) {
+    const jobId = match[1];
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      if (!activeSockets.has(jobId)) {
+        activeSockets.set(jobId, new Set());
+      }
+      activeSockets.get(jobId).add(ws);
+      console.log(`WebSocket client connected for jobId: ${jobId}. Active listeners: ${activeSockets.get(jobId).size}`);
+      
+      ws.on("close", () => {
+        const clientSet = activeSockets.get(jobId);
+        if (clientSet) {
+          clientSet.delete(ws);
+          console.log(`WebSocket client disconnected for jobId: ${jobId}. Active listeners: ${clientSet.size}`);
+          if (clientSet.size === 0) {
+            activeSockets.delete(jobId);
+          }
+        }
+      });
+    });
+  } else {
+    socket.destroy();
+  }
+});
+
+server.listen(PORT, () => {
   console.log(`server is running on port ${PORT}`);
 });
 

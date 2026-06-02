@@ -327,12 +327,17 @@ const LearningPage = () => {
   // Use actual generated lesson data — no hardcoded fallback so the wrong topic never shows
   const FetchData = lessonsData;
 
+  useEffect(() => {
+    console.log("[DIAGNOSTIC] LearningPage slides loaded:", FetchData);
+  }, [FetchData]);
+
   const [selectedAnswerIndex, setSelectedAnswerIndex] = useState<number | null>(
     null
   );
   const [hasAnswered, setHasAnswered] = useState(false);
   const [currentSlideIndex, setCurrentSlideIndex] = useState(0);
   const [currentVideoIndex, setCurrentVideoIndex] = useState(0);
+  const [maxReachedSlideIndex, setMaxReachedSlideIndex] = useState(0);
 
   //Narration Logic
   const [narrationWords, setNarrationWords] = useState<string[]>([]);
@@ -347,6 +352,14 @@ const LearningPage = () => {
   const answer = currentSlide.assessment.multiple_choice.choices;
   const question = currentSlide.assessment.multiple_choice.question;
   const correctAnswerIndex = currentSlide.assessment.multiple_choice.correct_index;
+  const isSlideCompleted = currentSlideIndex < maxReachedSlideIndex || hasAnswered;
+  const mediaUrl = currentSlide.image_url || videoURLs[currentSlideIndex] || videoURLs[currentVideoIndex] || "";
+  const isVideo = typeof mediaUrl === "string" && (
+    mediaUrl.toLowerCase().endsWith(".mp4") || 
+    mediaUrl.toLowerCase().endsWith(".webm") || 
+    mediaUrl.includes("firebasestorage.googleapis.com") || 
+    mediaUrl.includes("placeholder.mp4")
+  );
 
   const lessonsDataRef = useRef<SceneData[]>(lessonsData);
   lessonsDataRef.current = lessonsData;
@@ -370,8 +383,16 @@ const LearningPage = () => {
   const [isSavingNote, setIsSavingNote] = useState(false);
   const [notesLoading, setNotesLoading] = useState(false);
 
-  // Polling logic for async generation
+  // WebSocket setup for async generation
   useEffect(() => {
+    // Reset state when a new lesson starts
+    setCurrentSlideIndex(0);
+    setCurrentVideoIndex(0);
+    setMaxReachedSlideIndex(0);
+    setJobProgress(0);
+    setJobMessage("Initializing generation request...");
+    setJobError(null);
+
     if (!jobId) {
       // Fallback: fetch all videos from Firebase Storage if no jobId exists (static/mock mode)
       const fetchVideos = async () => {
@@ -409,41 +430,73 @@ const LearningPage = () => {
       return;
     }
 
-    let intervalId: NodeJS.Timeout | undefined = undefined;
-    const pollJobStatus = async () => {
-      try {
-        const response = await authFetch(`${BACKEND_URL}/api/job-status/${jobId}`);
-        if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
-        }
-        const job = await response.json();
-        
-        setJobProgress(job.progress || 0);
-        setJobMessage(job.message || "Processing...");
+    setLoading(true);
+    
+    // Resolve ws/wss protocol relative to BACKEND_URL
+    let wsUrl = "";
+    try {
+      const url = new URL(BACKEND_URL);
+      const protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      wsUrl = `${protocol}//${url.host}/ws/generation/${jobId}`;
+    } catch (e) {
+      wsUrl = `ws://localhost:3001/ws/generation/${jobId}`;
+    }
+    
+    console.log(`Connecting to generation WebSocket: ${wsUrl}`);
+    const socket = new WebSocket(wsUrl);
 
-        if (job.status === "completed") {
-          if (intervalId) clearInterval(intervalId);
-          intervalId = undefined;
-          setLessonsData(job.data?.scenes || []);
-          setVideoURLs(job.video_urls || []);
+    socket.onmessage = (event) => {
+      try {
+        const payload = JSON.parse(event.data);
+        console.log("WebSocket event received:", payload);
+        
+        if (payload.progress !== undefined) {
+          setJobProgress(payload.progress);
+        }
+        if (payload.message) {
+          setJobMessage(payload.message);
+        }
+
+        if (payload.status === "completed" || payload.status === "lesson_ready") {
+          socket.close();
+          const scenes = payload.data?.scenes || [];
+          setLessonsData(scenes);
           setLoading(false);
-        } else if (job.status === "failed") {
-          if (intervalId) clearInterval(intervalId);
-          intervalId = undefined;
-          setJobError(job.error || "An unexpected error occurred during rendering.");
+        } else if (payload.status === "failed") {
+          socket.close();
+          setJobError(payload.error || "An unexpected error occurred during rendering.");
           setLoading(false);
         }
-      } catch (err: unknown) {
-        console.error("Error polling job status:", err);
+      } catch (err) {
+        console.error("Error parsing WebSocket message:", err);
       }
     };
 
-    setLoading(true);
-    pollJobStatus(); // run immediately
-    intervalId = setInterval(pollJobStatus, 2000);
+    socket.onerror = (error) => {
+      console.error("WebSocket error details:", error);
+    };
+
+    socket.onclose = (event) => {
+      console.log(`WebSocket connection closed (code: ${event.code}, reason: ${event.reason})`);
+      // Fallback in case of unexpected close before completion
+      if (event.code !== 1000 && event.code !== 1001) {
+        console.warn("WebSocket closed unexpectedly. Attempting status fetch...");
+        authFetch(`${BACKEND_URL}/api/job-status/${jobId}`)
+          .then(res => res.json())
+          .then(job => {
+            if (job.status === "completed") {
+              setLessonsData(job.data?.scenes || []);
+              setLoading(false);
+            } else if (job.status === "failed") {
+              setJobError(job.error || "An unexpected error occurred.");
+              setLoading(false);
+            }
+          }).catch(e => console.error("Job status fallback fetch error:", e));
+      }
+    };
 
     return () => {
-      if (intervalId) clearInterval(intervalId);
+      socket.close();
     };
   }, [jobId]);
 
@@ -604,22 +657,34 @@ const LearningPage = () => {
   }
 
   function handleNextSlide() {
-    const totalSlides = Math.min(FetchData.length, 5);
+    const totalSlides = Math.min(FetchData.length || videoURLs.length || 5, 5);
     if (currentSlideIndex < totalSlides - 1) {
-      setCurrentSlideIndex((prevIndex) => prevIndex + 1);
+      const nextIndex = currentSlideIndex + 1;
+      setCurrentSlideIndex(nextIndex);
+      setMaxReachedSlideIndex((prev) => Math.max(prev, nextIndex));
+      if (videoURLs.length > 0) {
+        setCurrentVideoIndex(Math.min(nextIndex, videoURLs.length - 1));
+      }
     } else {
       setCurrentSlideIndex(0);
-    }
-
-    if (videoURLs.length > 0) {
-      if (currentVideoIndex < videoURLs.length - 1) {
-        setCurrentVideoIndex((prevIndex) => prevIndex + 1);
-      } else {
+      if (videoURLs.length > 0) {
         setCurrentVideoIndex(0);
       }
     }
     setSelectedAnswerIndex(null);
     setHasAnswered(false);
+  }
+
+  function handlePrevSlide() {
+    if (currentSlideIndex > 0) {
+      const prevIndex = currentSlideIndex - 1;
+      setCurrentSlideIndex(prevIndex);
+      if (videoURLs.length > 0) {
+        setCurrentVideoIndex(prevIndex);
+      }
+      setSelectedAnswerIndex(null);
+      setHasAnswered(false);
+    }
   }
 
   const [direction, setDirection] = useState(1);
@@ -1581,11 +1646,13 @@ const LearningPage = () => {
             exit="exit"
             className="grid grid-cols-1 md:grid-cols-3 gap-4 md:gap-6 w-full max-w-6xl"
           >
-            {/* Box 1: Video */}
+            {/* Box 1: Visual Carousel */}
             <div className="relative group overflow-hidden rounded-xl border border-white/10 md:col-span-2 h-72 md:h-96 bg-zinc-900/50 backdrop-blur-sm transition-all duration-300 hover:border-white/30 hover:bg-zinc-900/70">
               <div className="absolute inset-0 bg-gradient-to-br from-indigo-500/20 via-purple-500/20 to-pink-500/20 opacity-0 group-hover:opacity-100 transition-opacity duration-500"></div>
               <div className="absolute inset-0 bg-grid-white/[0.02] bg-[size:20px_20px]"></div>
-              <div className="h-full w-full flex items-center justify-center p-2">
+              
+              {/* Media Element Container */}
+              <div className="h-full w-full flex items-center justify-center p-2 relative z-10">
                 {loading ? (
                   <div className="text-white/70 flex flex-col items-center">
                     <svg
@@ -1608,25 +1675,101 @@ const LearningPage = () => {
                         d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
                       ></path>
                     </svg>
-                    <span>Loading videos...</span>
+                    <span className="text-sm text-neutral-400 mt-2">{jobMessage}</span>
+                    <div className="w-48 bg-white/10 h-1.5 rounded-full overflow-hidden mt-3 border border-white/5">
+                      <div 
+                        className="bg-indigo-500 h-full transition-all duration-300 ease-out" 
+                        style={{ width: `${jobProgress}%` }}
+                      ></div>
+                    </div>
                   </div>
-                ) : videoURLs.length > 0 ? (
-                  <div className="w-auto h-auto">
-                    <video
-                      src={videoURLs[currentVideoIndex]}
-                      autoPlay
-                      muted
-                      loop
-                      className="object-contain rounded-lg"
-                      key={videoURLs[currentVideoIndex]}
-                    ></video>
-                  </div>
+                ) : mediaUrl ? (
+                  isVideo ? (
+                    <div className="w-auto h-auto flex items-center justify-center">
+                      <video
+                        src={mediaUrl}
+                        autoPlay
+                        muted
+                        loop
+                        className="object-contain rounded-lg max-h-[250px] md:max-h-[320px]"
+                        key={mediaUrl}
+                      ></video>
+                    </div>
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center p-2">
+                      <img
+                        src={mediaUrl}
+                        alt={currentSlide.title}
+                        className="max-w-full max-h-[250px] md:max-h-[320px] object-contain rounded-lg shadow-lg border border-white/5 bg-zinc-950/80"
+                        key={mediaUrl}
+                      />
+                    </div>
+                  )
                 ) : (
                   <div className="text-white/70">
-                    No videos found in storage
+                    No visual illustration found in storage
                   </div>
                 )}
               </div>
+
+              {/* Chevron Navigation Overlays */}
+              {!loading && (FetchData.length > 0 || videoURLs.length > 0) && (
+                <>
+                  {/* Left Chevron */}
+                  {currentSlideIndex > 0 && (
+                    <button
+                      onClick={handlePrevSlide}
+                      className="absolute left-4 top-1/2 -translate-y-1/2 z-20 p-2.5 rounded-full bg-black/60 border border-white/10 text-white/70 hover:text-white hover:bg-black/80 hover:scale-110 active:scale-95 transition-all duration-200"
+                      aria-label="Previous Slide"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className="w-5 h-5">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 19.5L8.25 12l7.5-7.5" />
+                      </svg>
+                    </button>
+                  )}
+
+                  {/* Right Chevron */}
+                  {currentSlideIndex < Math.min(FetchData.length || videoURLs.length, 5) - 1 && 
+                    (currentSlideIndex < maxReachedSlideIndex || isSlideCompleted) && (
+                    <button
+                      onClick={handleNextSlide}
+                      className="absolute right-4 top-1/2 -translate-y-1/2 z-20 p-2.5 rounded-full bg-black/60 border border-white/10 text-white/70 hover:text-white hover:bg-black/80 hover:scale-110 active:scale-95 transition-all duration-200"
+                      aria-label="Next Slide"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={2.5} stroke="currentColor" className="w-5 h-5">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M8.25 4.5l7.5 7.5-7.5 7.5" />
+                      </svg>
+                    </button>
+                  )}
+                </>
+              )}
+              
+              {/* Pagination Dots at Bottom Center */}
+              {!loading && (FetchData.length > 0 || videoURLs.length > 0) && (
+                <div className="absolute bottom-3 left-1/2 -translate-x-1/2 z-20 flex gap-2">
+                  {Array.from({ length: Math.min(FetchData.length || videoURLs.length, 5) }).map((_, i) => (
+                    <button
+                      key={i}
+                      onClick={() => {
+                        if (i <= maxReachedSlideIndex) {
+                          setCurrentSlideIndex(i);
+                          setSelectedAnswerIndex(null);
+                          setHasAnswered(false);
+                        }
+                      }}
+                      className={`h-2 rounded-full transition-all duration-300 ${
+                        i === currentSlideIndex
+                          ? "w-6 bg-indigo-500"
+                          : i <= maxReachedSlideIndex
+                          ? "w-2 bg-white/50 hover:bg-white/80"
+                          : "w-2 bg-white/20 cursor-not-allowed"
+                      }`}
+                      disabled={i > maxReachedSlideIndex}
+                    />
+                  ))}
+                </div>
+              )}
+
               <div className="absolute inset-0 pointer-events-none border border-white/5 rounded-xl"></div>
               <div className="absolute -inset-px bg-gradient-to-r from-purple-500/30 via-transparent to-cyan-500/30 rounded-xl opacity-0 group-hover:opacity-100 blur-xl transition-opacity duration-500"></div>
             </div>
@@ -1782,18 +1925,17 @@ const LearningPage = () => {
                         delay: index * 0.1,
                       }}
                       className={`w-full text-left px-4 py-2.5 rounded-lg border ${
-                        selectedAnswerIndex === index &&
-                        correctAnswerIndex === index
+                        (selectedAnswerIndex === index && correctAnswerIndex === index) || (currentSlideIndex < maxReachedSlideIndex && correctAnswerIndex === index)
                           ? "bg-green-500/30 border-green-500/50 text-white"
                           : selectedAnswerIndex === index
                           ? "bg-red-500/30 border-red-500/50 text-white"
                           : "bg-white/5 border-white/10 text-white/70 hover:bg-white/10 hover:border-white/20"
                       } transition-all duration-200 ${
-                        hasAnswered && "cursor-default"
+                        (hasAnswered || currentSlideIndex < maxReachedSlideIndex) && "cursor-default"
                       }`}
-                      onClick={() => !hasAnswered && handleAnswerClick(index)}
+                      onClick={() => !hasAnswered && currentSlideIndex === maxReachedSlideIndex && handleAnswerClick(index)}
                       key={index}
-                      disabled={hasAnswered}
+                      disabled={hasAnswered || currentSlideIndex < maxReachedSlideIndex}
                     >
                       {info}
                     </motion.button>
@@ -1816,7 +1958,7 @@ const LearningPage = () => {
               <div className="h-full w-full flex items-center justify-center relative z-10">
                 <HoverBorderGradient
                   containerClassName={`rounded-full ${
-                    !hasAnswered && "opacity-50 pointer-events-none"
+                    !isSlideCompleted && "opacity-50 pointer-events-none"
                   }`}
                   as="button"
                   className="bg-black text-white flex items-center space-x-2 px-6 py-3"

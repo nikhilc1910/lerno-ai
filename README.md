@@ -96,6 +96,12 @@ The platform combines a React/TypeScript frontend with a dual-backend architectu
 
 > For detailed architecture documentation, see [docs/architecture.md](docs/architecture.md).
 
+### 🎨 Real-Time SVG Vector Illustration Pipeline & Fallback
+The platform generates educational SVG diagrams and illustrations for each lesson slide using the Gemini API.
+
+* **Primary Pipeline**: Visuals are generated as raw SVGs and uploaded to the Supabase Storage bucket `educational-images`. The platform then delivers public URLs to the client.
+* **Resilient Base64 Fallback**: If the `educational-images` bucket is missing (`404 Bucket not found`) or write access is restricted, the backend automatically converts the SVG markup into an inline **base64 Data URL** (`data:image/svg+xml;base64,...`) returned inside the lesson payload. The React carousel renders these vector illustrations directly, ensuring uninterrupted lessons.
+
 ---
 
 ## 🛠 Tech Stack

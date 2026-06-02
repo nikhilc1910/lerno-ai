@@ -173,144 +173,63 @@ BANNED_ATTRS = {
     'unlink', 'chmod', 'environ', 'getenv', 'putenv'
 }
 
-def validate_manim_code(code: str) -> tuple[bool, str]:
+def send_job_update(job_id: str, status: str, progress: int, message: str, data: dict = None) -> None:
     """
-    Parses generated Python code with ast.parse() and rejects any code
-    that imports banned modules or calls dangerous built-ins.
-    Returns (is_safe: bool, reason: str).
+    Sends a progress update to the Express gateway to be broadcasted via WebSockets.
     """
+    url = "http://localhost:3001/internal/job-update"
+    payload = {
+        "job_id": job_id,
+        "status": status,
+        "progress": progress,
+        "message": message,
+        "data": data
+    }
     try:
-        tree = ast.parse(code)
-    except SyntaxError as e:
-        return False, f"Syntax error at line {e.lineno}: {e.msg}"
-
-    for node in ast.walk(tree):
-        # Block banned imports: import os / from sys import ...
-        if isinstance(node, (ast.Import, ast.ImportFrom)):
-            for alias in getattr(node, 'names', []):
-                base = alias.name.split('.')[0]
-                if base in BANNED_IMPORTS:
-                    return False, f"Blocked import: {alias.name}"
-
-        # Block banned built-in calls: eval(), exec(), open()
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name):
-                if node.func.id in BANNED_CALLS:
-                    return False, f"Blocked call: {node.func.id}()"
-
-        # Block dangerous attribute access: os.system, os.environ, etc.
-        if isinstance(node, ast.Attribute):
-            if node.attr in BANNED_ATTRS:
-                return False, f"Blocked attribute access: .{node.attr}"
-
-    return True, ""
-
-
-MANIM_AUDIT_DIR = Path("/tmp/lerno_manim_audit")
-MANIM_AUDIT_DIR.mkdir(parents=True, exist_ok=True)
-
-logger.info(f"Manim audit logs → {MANIM_AUDIT_DIR}")
-
-def audit_log_script(code: str, scene_idx: int, passed: bool, reason: str = "") -> None:
-    """
-    Writes every generated Manim script to /tmp/lerno_manim_audit/ for debugging.
-    Files are prefixed ok_ or blocked_ so failures are easy to find.
-    """
-    try:
-        h = hashlib.md5(code.encode()).hexdigest()[:8]
-        prefix = "ok" if passed else "blocked"
-        fpath = MANIM_AUDIT_DIR / f"{prefix}_scene{scene_idx}_{h}.py"
-        header = f"# passed={passed}  reason={reason or 'none'}\n\n"
-        fpath.write_text(header + code)
+        response = requests.post(url, json=payload, timeout=5)
+        logger.info(f"Broadcasted job update for job={job_id}: status={status}, progress={progress}%, response={response.status_code}")
     except Exception as e:
-        logger.warning(f"Could not write audit log: {e}")
+        logger.warning(f"Failed to broadcast job update to Express gateway: {e}")
 
 
-async def ask_gemini_to_fix_manim(
-    topic: str,
-    scene_idx: int,
-    failed_code: str,
-    error_msg: str,
-    attempt: int,
-) -> str:
-    fix_prompt = f"""A Manim CE v0.19.0 script failed on attempt {attempt}.
+def upload_svg_to_supabase(svg_content: str, file_path: str) -> str:
+    """
+    Uploads SVG content to Supabase Storage 'educational-images' bucket.
+    Falls back to base64 Data URL if configuration is missing or upload fails.
+    """
+    import base64
+    supabase_url = os.getenv("VITE_SUPABASE_URL")
+    supabase_anon_key = os.getenv("VITE_SUPABASE_ANON_KEY")
+    
+    if not supabase_url or not supabase_anon_key:
+        logger.warning("Supabase configuration missing in env. Falling back to inline base64 SVG.")
+        b64_data = base64.b64encode(svg_content.encode("utf-8")).decode("utf-8")
+        return f"data:image/svg+xml;base64,{b64_data}"
+        
+    supabase_url = supabase_url.strip().rstrip("/")
+    url = f"{supabase_url}/storage/v1/object/educational-images/{file_path}"
+    
+    headers = {
+        "Authorization": f"Bearer {supabase_anon_key}",
+        "apikey": supabase_anon_key,
+        "Content-Type": "image/svg+xml",
+        "x-upsert": "true"
+    }
+    
+    try:
+        response = requests.put(url, data=svg_content.encode("utf-8"), headers=headers, timeout=10)
+        if response.status_code in [200, 201]:
+            public_url = f"{supabase_url}/storage/v1/object/public/educational-images/{file_path}"
+            logger.info(f"Uploaded SVG to Supabase Storage: {public_url}")
+            return public_url
+        else:
+            logger.warning(f"Supabase upload returned status {response.status_code}: {response.text}. Using base64 fallback.")
+    except Exception as e:
+        logger.warning(f"Supabase upload exception: {e}. Using base64 fallback.")
+        
+    b64_data = base64.b64encode(svg_content.encode("utf-8")).decode("utf-8")
+    return f"data:image/svg+xml;base64,{b64_data}"
 
-EXACT ERROR (last 800 chars):
-{error_msg[-800:]}
-
-FAILED CODE:
-{failed_code}
-
-Rewrite so it compiles. Rules:
-- Do NOT use: scale_tips, match_style on Arrow, get_graph (use .plot())
-- Do NOT use np.PI — use bare PI from manim
-- Do NOT import: os, sys, subprocess, requests, pathlib
-- Every class MUST extend Scene and implement construct(self)
-- Return ONLY corrected Python code — no markdown fences
-
-Context: scene {scene_idx} of a lesson about "{topic}"."""
-
-    if not model:
-        raise ValueError("Gemini API model is not configured or unavailable.")
-
-    # Using model.ainvoke to execute Gemini API call asynchronously
-    resp = await model.ainvoke(fix_prompt)
-    raw = resp.content.strip()
-    raw = re.sub(r"^```(?:python)?\n", "", raw)
-    raw = re.sub(r"\n```$", "", raw)
-    return raw.strip()
-
-
-MAX_MANIM_ATTEMPTS = 3
-
-async def compile_scene_with_retry(
-    topic: str,
-    scene_idx: int,
-    initial_code: str,
-    job_id: str,
-    write_script_fn,
-    run_manim_fn,
-    placeholder_url: str,
-) -> tuple[str, bool]:
-    code = initial_code
-    for attempt in range(1, MAX_MANIM_ATTEMPTS + 1):
-        job_store.update(job_id, {
-            "log": f"Compiling scene {scene_idx} — attempt {attempt}/{MAX_MANIM_ATTEMPTS}…",
-            "message": f"Compiling scene {scene_idx} — attempt {attempt}/{MAX_MANIM_ATTEMPTS}…"
-        })
-
-        # Gate 1: AST safety
-        is_safe, reason = validate_manim_code(code)
-        audit_log_script(code, scene_idx, is_safe, reason)
-        if not is_safe:
-            logger.warning(f"job={job_id} scene={scene_idx} attempt={attempt} AST blocked: {reason}")
-            if attempt < MAX_MANIM_ATTEMPTS:
-                code = await ask_gemini_to_fix_manim(
-                    topic, scene_idx, code, f"Safety violation: {reason}", attempt)
-                continue
-            job_store.update(job_id, {"scene_warnings": f"scene {scene_idx}: placeholder after {MAX_MANIM_ATTEMPTS} AST violations"})
-            return placeholder_url, False
-
-        # Gate 2: Manim compile
-        script_path = write_script_fn(code, scene_idx)
-        try:
-            result = run_manim_fn(script_path)
-        except subprocess.TimeoutExpired:
-            logger.error(f"job={job_id} scene={scene_idx} attempt={attempt} timeout")
-            result = None
-
-        if result is not None and result.returncode == 0:
-            logger.info(f"job={job_id} scene={scene_idx} OK on attempt {attempt}")
-            return script_path, True
-
-        error_text = result.stderr if result else "Timed out after 90 seconds"
-        logger.warning(f"job={job_id} scene={scene_idx} attempt={attempt} failed: {error_text[-200:]}")
-        if attempt < MAX_MANIM_ATTEMPTS:
-            code = await ask_gemini_to_fix_manim(topic, scene_idx, code, error_text, attempt)
-
-    logger.error(f"job={job_id} scene={scene_idx} all {MAX_MANIM_ATTEMPTS} attempts failed")
-    job_store.update(job_id, {"scene_warnings": f"scene {scene_idx}: placeholder after {MAX_MANIM_ATTEMPTS} failed attempts"})
-    return placeholder_url, False
 
 JOBS_FILE = Path(os.getenv("JOBS_FILE", "/tmp/lerno_jobs.json"))
 JOB_TTL_SECONDS = 86400  # auto-expire jobs after 24 hours
@@ -486,22 +405,29 @@ wikipedia = WikipediaAPIWrapper(top_k_results=2)
 
 STORYBOARD_PROMPT_TEMPLATE = PromptTemplate(
     input_variables=["audience", "topic", "wikipedia_info"],
-    template="""For an audience of a {audience}, generate a series of 3 frames to explain {topic}. Each frame should be a single animation point, such as visualizing squaring a number visually or adding a vector tip to tail. It should not take longer than 15 seconds.
+    template="""For an audience of a {audience}, generate a series of exactly 6 frames to explain {topic}. Each frame should be a single visual page explaining a core sub-concept.
     Also use this wikipedia information to help create the frames {wikipedia_info}, but it is not necessary only for reference.
-
-For example, explaining vector addition would be:
-1. Frame showing 2 vectors from the origin explaining that these can be any arbitrary vector.
-2. Showing vector addition numerically, adding each component numerically.
-3. Explain a simple practical example of vector addition, how 2 forces can combine together into a larger force.
 
 Do not include a frame for a quiz.
 
-Each frame should come with a short description of what it will talk about. This is meant to be the storyboard for an animated video explaining this concept.
+Each frame should come with a short title and a description of what it will display and talk about.
 
 Format the frames in the following JSON format:
 
 {{ "frames": 
 [
+{{
+"title": "xxxx",
+"description": "xxxx"
+}},
+{{
+"title": "xxxx",
+"description": "xxxx"
+}},
+{{
+"title": "xxxx",
+"description": "xxxx"
+}},
 {{
 "title": "xxxx",
 "description": "xxxx"
@@ -520,9 +446,41 @@ Format the frames in the following JSON format:
 Ensure that the JSON is valid.
 
 The title should be short, limit of 5 words.
-The description should be a few sentences, enough for someone to understand what to do and how to animate and explain this frame.
+The description should be a few sentences, enough for someone to understand what to explain in this frame.
 
 Output only the plaintext JSON format of the frames. DO NOT OUTPUT MARKDOWN. DO NOT INCLUDE A PREAMBLE OR POSTAMBLE."""
+)
+
+VISUAL_GENERATOR_PROMPT_TEMPLATE = PromptTemplate(
+    input_variables=["title", "description", "narration", "topic"],
+    template="""You are a professional educational graphic designer and front-end developer. Generate a beautiful, modern, and high-quality educational SVG diagram or illustration to visualize the concept: "{title}".
+
+Context/Description of this scene:
+"{description}"
+
+Narration script:
+"{narration}"
+
+Overall lesson topic:
+"{topic}"
+
+Guidelines for SVG:
+1. It must be a complete, valid, self-contained SVG string starting with <svg> and ending with </svg>.
+2. Do NOT use markdown fences or code block formatting (e.g. no ```xml or ```svg). Return ONLY the raw SVG code.
+3. SVG dimensions should be viewBox="0 0 800 450" (16:9 aspect ratio) for standard horizontal slideshow display.
+4. Use rich, premium educational design aesthetics:
+   - Deep, elegant dark background (e.g., #0B0F19 or #121827) so it fits with the platform's sleek dark theme.
+   - Harmonic, tailored color palette (e.g., violet/indigo #6366F1, emerald green #10B981, amber yellow #F59E0B, sky blue #38BDF8, crimson red #EF4444).
+   - High-quality modern typography for labels and formulas. Use clean sans-serif system fonts (e.g., font-family="system-ui, -apple-system, sans-serif") or monospaced for numbers, with appropriate font sizes (20px to 32px for titles, 14px to 18px for labels) and high contrast.
+   - Include crisp vector graphics: use lines, dashed lines, circles, polygons, curves, grid coordinate lines, and custom marker arrows to create diagrams, labeled illustrations, concept maps, formula breakdowns, or process flowcharts.
+   - Group related elements using <g> and position them carefully to avoid any overlap.
+   - Do NOT use external images or load external fonts. All graphics must be drawn with native SVG elements.
+5. Create a visual that directly and beautifully explains the concept, for example:
+   - For a math formula, show the formula styled in LaTeX-like layout using SVG <text> elements, with colorful annotations pointing to and labeling each variable.
+   - For physics (e.g., pendulum), draw the pendulum pivot, string, angle arc, forces (gravity, tension) as colored arrows, and the bob.
+   - For a cycle or process, draw a multi-step node flow with arrows and descriptions.
+
+Return ONLY the raw SVG code."""
 )
 
 ############################################################---- OLD PROMPT --------##########################################################################
@@ -677,6 +635,56 @@ def generate_response_raw(prompt):
         
     return verify_child_safety(message.content.strip())
 
+
+async def generate_svg_visual(title: str, description: str, narration: str, topic: str) -> str:
+    """
+    Generate clean, raw SVG illustration using Gemini.
+    """
+    prompt = VISUAL_GENERATOR_PROMPT_TEMPLATE.format(
+        title=title,
+        description=description,
+        narration=narration,
+        topic=topic
+    )
+    
+    if not model:
+        raise ValueError("Gemini API model is not configured or unavailable.")
+        
+    try:
+        # Run asynchronously
+        resp = await model.ainvoke(prompt)
+        raw = resp.content.strip()
+        
+        # Remove potential markdown wrappers (like ```xml or ```svg)
+        raw = re.sub(r"^```(?:xml|svg|html)?\n", "", raw)
+        raw = re.sub(r"\n```$", "", raw)
+        raw = raw.strip()
+        
+        # Simple validation: must start with <svg and end with </svg>
+        if "<svg" in raw and "</svg>" in raw:
+            # Extract only the svg part in case there is trailing text
+            start_idx = raw.find("<svg")
+            end_idx = raw.rfind("</svg>") + len("</svg>")
+            svg_content = raw[start_idx:end_idx]
+            logger.info(f"Gemini successfully returned SVG. Length: {len(svg_content)} characters.")
+            return svg_content
+        else:
+            logger.warning("Gemini returned text but it does not contain valid <svg> and </svg> tags.")
+            
+    except Exception as e:
+        logger.error(f"Error generating SVG visual: {e}")
+        
+    # Return a basic placeholder SVG in case of failure
+    placeholder_svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 450" width="100%" height="100%">
+        <rect width="800" height="450" fill="#0B0F19"/>
+        <circle cx="400" cy="225" r="80" fill="none" stroke="#6366F1" stroke-width="4" stroke-dasharray="8 4"/>
+        <text x="400" y="225" font-family="system-ui, sans-serif" font-size="24" fill="#FFFFFF" text-anchor="middle" dominant-baseline="middle">{title}</text>
+        <text x="400" y="270" font-family="system-ui, sans-serif" font-size="14" fill="#9CA3AF" text-anchor="middle" dominant-baseline="middle">Visual illustration placeholder</text>
+    </svg>"""
+    logger.info(f"Using fallback SVG for scene '{title}'. Length: {len(placeholder_svg)} characters.")
+    return placeholder_svg
+
+
 def classify_input(user_input):
     """Classifies user input into topic and audience level using Gemini."""
     prompt = f"""Classify the following input into a topic to explain and an audience level. If no audience level is explicitly mentioned, default to "college student".
@@ -729,200 +737,6 @@ def generate_scene(frame):
         print(f"Received JSON: {scene_json}")
         return None
 
-def generate_animation_code(narration, animation_description, title, scene_number=None):
-    """Generate Manim animation code for a scene"""
-    if scene_number:
-        scene_class_name = f"Scene{scene_number}"
-    else:
-        scene_class_name = ''.join(c for c in title if c.isalnum())
-        if not scene_class_name:
-            scene_class_name = "AnimationScene"
-    
-    prompt = """
-0. Use EXTREMELY SIMPLE Manim code with NO LOOPS or complex logic,Generate only those stuff which is possible in manim , Don't try to use complex shape or function like ImageMobject.
-1. Given the scene description and title, write COMPLETE, READY-TO-RUN Manim code for this scene in 3Blue1Brown style. This scene should be between 10 to 20 seconds.
-2. USE MANIM COMMUNITY EDITION (ManimCE) VERSION 0.19.0 SYNTAX ONLY.
-3. Include: from manim import *
-4. Use "{0}" as class name (not "Scene").
-5. DO NOT INCLUDE python TAGS OR ANY MARKDOWN.
-6. DO NOT INCLUDE ANY INTRODUCTION LIKE "Here's the Manim code for the scene based on your requirements:" OR OTHER EXPLANATORY TEXT.
-7. CRITICAL RESTRICTIONS:
-   - ABSOLUTELY NO FOR LOOPS OR WHILE LOOPS
-   - NO LIST COMPREHENSIONS
-   - NO CUSTOM FUNCTIONS OR METHODS
-   - USE ONLY SIMPLE SEQUENTIAL ANIMATIONS
-   - LIMIT TO 5-7 SEQUENTIAL self.play() CALLS MAXIMUM
-   - NO CONDITIONAL LOGIC (if/else statements)
-8. AVOID:
-   - ThoughtBubble (use Text, MathTex, SurroundingRectangle, or Circle)
-   - Deprecated methods/parameters (add_tip(), scale_tips)
-   - Constructor conflicts
-   - Brace.get_text() (use Tex/MathTex and position manually)
-9. For arrows: Arrow(start=ORIGIN, end=[x,y,0], buff=0, color=YELLOW)
-10. For axes: Axes(x_range=[-5, 5, 1], y_range=[-3, 3, 1])
-11. Use Text() or MathTex() with font_size 24-30pt.
-12. Use standard animations: Create(), Write(), FadeIn/Out(), Transform(), GrowArrow()
-13. Use [x, y, 0] coordinate system for all 2D points.
-14. Include self.play() with self.wait() commands.
-
-15. TEXT POSITIONING (CRITICAL):
-   - NEVER place text on top of other text
-   - For titles, use .to_edge(UP, buff=1) with sufficient buffer
-   - For subtitles, position below titles with .next_to(title, DOWN, buff=0.5)
-   - Use .shift(UP/DOWN/LEFT/RIGHT) to ensure text doesn't overlap
-   - If using multiple text elements, create a VGroup and use .arrange(DOWN, buff=0.5)
-   - Always add sufficient spacing between text elements (minimum buff=0.3)
-   - For multi-line text, create separate Text objects and arrange them vertically
-
-16. Use colors: RED, GREEN, BLUE, YELLOW, PURPLE, ORANGE, WHITE.
-17. Use 2-AXIS DIAGRAMS for math concepts.
-18. Don't invent parameters.
-19. Keep text concise (<10 words).
-20. Follow title if description is vague.
-21. Include animations and place topic at bottom.
-22. NEVER USE 'scale_tips' PARAMETER.
-23. NEVER use random() or random.choice() functions
-24.DON'T DO THIS "```python" IN THE CODE BLOCK, JUST WRITE THE MANIM CODE.
-25. For 384px height compatibility:
-   - Center elements (±3 units from center)
-   - Keep content in middle 70% of screen
-   - Use font_size≥24
-   - Maximum 3-4 elements at once
-   - Scale complex equations to 0.8
-   - Keep 0.5 units padding from edges
-   - Use WHITE/YELLOW text on dark backgrounds
-   - Scale complex diagrams to 0.7
-
-Here is an example of valid Manim CE 0.19.0 code:
-
-from manim import *
-
-class VectorExample(Scene):
-    def construct(self):
-        # Create axes
-        axes = Axes(
-            x_range=[-5, 5, 1], 
-            y_range=[-3, 3, 1],
-            axis_config={{"color": BLUE}}
-        )
-        
-        # Create a vector as an arrow
-        vector = Arrow(start=ORIGIN, end=[2, 1, 0], buff=0, color=YELLOW)
-        vector_label = MathTex(r"\\vec{{v}} = (2,1)").next_to(vector, UP)
-        
-        # Create components
-        x_component = DashedLine(start=ORIGIN, end=[2, 0, 0], color=RED)
-        y_component = DashedLine(start=[2, 0, 0], end=[2, 1, 0], color=GREEN)
-        
-        x_label = MathTex("2").next_to(x_component, DOWN)
-        y_label = MathTex("1").next_to(y_component, RIGHT)
-        
-        # Animation sequence
-        self.play(Create(axes))
-        self.wait(0.5)
-        self.play(GrowArrow(vector), Write(vector_label))
-        self.wait(0.5)
-        self.play(Create(x_component), Write(x_label))
-        self.wait(0.5)
-        self.play(Create(y_component), Write(y_label))
-        self.wait(1)
-
-Narration: 
-{1}
-
-Animation Description:
-{2}
-
-Title:
-{3}
-
-ONLY RETURN THE COMPLETE MANIM CODE FOR THE SCENE. DO NOT INCLUDE A PREAMBLE OR POSTAMBLE.
-""".format(scene_class_name, narration, animation_description, title) 
-    
-    response = generate_response_raw(prompt)
-    if not response:
-        response = f"""from manim import *
-class {scene_class_name}(Scene):
-    def construct(self):
-        text = Text("No animation generated", font_size=48)
-        self.play(Write(text))
-        self.wait(1)
-        """
-
-    response = response.replace("scale_tips=True", "")
-    response = response.replace("scale_tips=False", "")
-    response = response.replace("scale_tips = True", "")
-    response = response.replace("scale_tips = False", "")
-    response = response.replace(", scale_tips", "")
-    response = response.replace(",scale_tips", "")
-
-    run_instructions = """# To run this animation, use the following command:
-# manim -pql <filename>.py {0}
-# or for higher quality:
-# manim -pqh <filename>.py {0}
-""".format(scene_class_name)
-
-    return run_instructions + response
-
-def generate_educational_content(user_input):
-    """Generate complete educational content from a user input"""
-    classification = classify_input(user_input)
-    audience = classification.get("audience", "college student")
-    topic = classification.get("topic", user_input)
-    
-    storyboard = create_storyboard(audience, topic)
-    result = {
-        "metadata": {
-            "topic": topic,
-            "audience": audience
-        },
-        "success": False,
-        "scenes": []
-    }
-    
-    if storyboard and "frames" in storyboard:
-        result["success"] = True
-        
-        for i, frame in enumerate(storyboard["frames"]):
-            if i >= 5:
-                break
-            
-            scene_number = i + 1
-            scene_data = {
-                "scene_number": scene_number,
-                "title": frame["title"],
-                "description": frame["description"]
-            }
-            
-            scene = generate_scene(frame["description"])
-            if scene:
-                if "narration" in scene:
-                    scene_data["narration"] = scene["narration"]
-                if "animation-description" in scene:
-                    scene_data["animation_description"] = scene["animation-description"]
-                
-                scene_data["assessment"] = {
-                    "multiple_choice": {
-                        "question": scene.get("multiple-choice-question", ""),
-                        "choices": scene.get("multiple-choice-choices", []),
-                        "correct_index": scene.get("correct-index", 0)
-                    },
-                    "free_response": {
-                        "question": scene.get("free-response-question", ""),
-                        "answer": scene.get("free-response-answer", "")
-                    }
-                }
-                
-                scene_data["manim_code"] = generate_animation_code(
-                    scene.get("narration", ""), 
-                    scene.get("animation-description", ""), 
-                    frame["title"],
-                    scene_number
-                )
-            
-            result["scenes"].append(scene_data)
-    
-    return result
 
 app = FastAPI()
 
@@ -1361,10 +1175,13 @@ class StateController:
         self.state = "MediaGen"
 
     async def node_media_gen(self):
+        # 1. Start generation stage
         job_store.update(self.job_id, {
+            "status": "generating",
             "progress": 40,
-            "message": "Starting visual asset compilation..."
+            "message": "Starting educational content generation..."
         })
+        send_job_update(self.job_id, "lesson_generation_started", 10, "Starting lesson generation...")
         
         storyboard = self.context["storyboard"]
         topic = self.context["topic"]
@@ -1380,90 +1197,106 @@ class StateController:
             "scenes": []
         }
         
-        video_urls = []
         scenes = storyboard.get("frames", [])
         total_scenes = len(scenes)
         
+        # We will generate narration and quiz for each frame first
+        scenes_data = []
         for idx, frame in enumerate(scenes):
             scene_number = idx + 1
-            job_store.update(self.job_id, {
-                "message": f"Compiling scene {scene_number} of {total_scenes}...",
-                "progress": int(40 + (idx / total_scenes) * 50)
-            })
+            progress = int(40 + (idx / total_scenes) * 20)  # progress 40% to 60%
+            message = f"Generating narration and questions for scene {scene_number} of {total_scenes}..."
             
+            job_store.update(self.job_id, {
+                "message": message,
+                "progress": progress
+            })
+            send_job_update(self.job_id, "generating", progress, message)
+            
+            scene = generate_scene(frame["description"])
+            if not scene:
+                scene = {
+                    "narration": f"In this section, we cover {frame['title']}.",
+                    "animation-description": frame["description"],
+                    "multiple-choice-question": f"What is the main topic of {frame['title']}?",
+                    "multiple-choice-choices": [topic, frame["title"], "Other", "None"],
+                    "correct-index": 1,
+                    "free-response-question": f"Describe the main concept of {frame['title']}.",
+                    "free-response-answer": frame["description"]
+                }
+                
             scene_data = {
                 "scene_number": scene_number,
                 "title": frame["title"],
-                "description": frame["description"]
-            }
-            
-            scene = generate_scene(frame["description"])
-            if scene:
-                if "narration" in scene:
-                    scene_data["narration"] = scene["narration"]
-                if "animation-description" in scene:
-                    scene_data["animation_description"] = scene["animation-description"]
-                
-                scene_data["assessment"] = {
+                "description": frame["description"],
+                "narration": scene.get("narration", f"In this section, we cover {frame['title']}."),
+                "animation_description": scene.get("animation-description", frame["description"]),
+                "assessment": {
                     "multiple_choice": {
-                        "question": scene.get("multiple-choice-question", ""),
-                        "choices": scene.get("multiple-choice-choices", []),
-                        "correct_index": scene.get("correct-index", 0)
+                        "question": scene.get("multiple-choice-question", f"What is the main topic of {frame['title']}?"),
+                        "choices": scene.get("multiple-choice-choices", [topic, frame["title"], "Other", "None"]),
+                        "correct_index": scene.get("correct-index", 1)
                     },
                     "free_response": {
-                        "question": scene.get("free-response-question", ""),
-                        "answer": scene.get("free-response-answer", "")
+                        "question": scene.get("free-response-question", f"Describe the main concept of {frame['title']}"),
+                        "answer": scene.get("free-response-answer", frame["description"])
                     }
                 }
-                
-                scene_data["manim_code"] = generate_animation_code(
-                    scene.get("narration", ""), 
-                    scene.get("animation-description", ""), 
-                    frame["title"],
-                    scene_number
-                )
+            }
+            scenes_data.append(scene_data)
             
-            # Compile manim script with retry logic
-            video_path, success = await compile_scene_with_retry(
-                topic=topic,
-                scene_idx=scene_number,
-                initial_code=scene_data.get("manim_code", ""),
-                job_id=self.job_id,
-                write_script_fn=write_temp_script,
-                run_manim_fn=lambda p: subprocess.run(
-                    ["manim", "-pql", "--progress_bar", "none", str(p), f"Scene{scene_number}"],
-                    capture_output=True,
-                    text=True,
-                    timeout=90,
-                ),
-                placeholder_url=PLACEHOLDER_VIDEO_URL,
+        # Send quiz_generated event at 60%
+        job_store.update(self.job_id, {
+            "message": "Narration and quiz questions successfully generated.",
+            "progress": 60
+        })
+        send_job_update(self.job_id, "quiz_generated", 60, "Narration and quiz questions successfully generated.")
+        
+        # 3. Generate and upload SVG visuals
+        for idx, scene_data in enumerate(scenes_data):
+            scene_number = idx + 1
+            progress = int(60 + (idx / total_scenes) * 25)  # progress 60% to 85%
+            message = f"Generating visual illustration for scene {scene_number} of {total_scenes}..."
+            
+            job_store.update(self.job_id, {
+                "message": message,
+                "progress": progress
+            })
+            send_job_update(self.job_id, "generating", progress, message)
+            
+            svg_content = await generate_svg_visual(
+                title=scene_data["title"],
+                description=scene_data["description"],
+                narration=scene_data["narration"],
+                topic=topic
             )
-
-            if success:
-                mp4_path = f"media/videos/animation_{scene_number}/480p15/Scene{scene_number}.mp4"
-                if os.path.exists(mp4_path):
-                    file_name = f"{uuid.uuid4()}_Scene{scene_number}.mp4"
-                    blob = bucket.blob(file_name)
-                    blob.upload_from_filename(mp4_path, content_type="video/mp4")
-                    blob.make_public()
-                    video_urls.append(blob.public_url)
-                    logger.info(f"Successfully uploaded {mp4_path} to Firebase")
-                else:
-                    logger.warning(f"Rendered video not found at {mp4_path}")
-                    video_urls.append(PLACEHOLDER_VIDEO_URL)
-            else:
-                video_urls.append(video_path)  # already placeholder
-                
+            
+            # Upload SVG to Supabase Storage
+            file_path = f"{self.job_id}_scene_{scene_number}.svg"
+            image_url = upload_svg_to_supabase(svg_content, file_path)
+            scene_data["image_url"] = image_url
+            
             result["scenes"].append(scene_data)
             
+        # Send images_generated event at 85%
+        job_store.update(self.job_id, {
+            "message": "All SVG illustrations generated and uploaded.",
+            "progress": 85
+        })
+        send_job_update(self.job_id, "images_generated", 85, "All SVG illustrations generated and uploaded.")
+        
+        # Complete the job!
         job_store.update(self.job_id, {
             "status": "completed",
             "progress": 100,
-            "message": "All educational assets and videos generated successfully!",
+            "message": "Lesson generation complete!",
             "data": result,
-            "video_urls": video_urls
+            "video_urls": [] # Retain key for compatibility
         })
+        
+        send_job_update(self.job_id, "lesson_ready", 100, "Lesson generation complete!", result)
         self.state = "Completed"
+
 
 async def process_data_background(job_id: str, prompt_text: str, user_id: str = "defaultUser"):
     """Background task that runs the StateController loop asynchronously"""
