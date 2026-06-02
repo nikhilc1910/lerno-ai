@@ -154,8 +154,7 @@ cp .env.example .env
 |----------|-------------|----------|
 | `PORT` | Express server port (default: 3001) | Yes |
 | `FASTAPI_URL` | FastAPI backend URL | Yes |
-| `ANTHROPIC_API_KEY` | Anthropic Claude API key | Yes |
-| `GOOGLE_API_KEY` | Google Gemini API key | Yes |
+| `GEMINI_API_KEY` | Google Gemini API key (fallback: `GOOGLE_API_KEY`) | Yes |
 | `FIREBASE_CREDENTIALS_JSON` | Firebase Admin SDK credential file path | Yes |
 | `FIREBASE_STORAGE_BUCKET` | Firebase Storage bucket name | Yes |
 | `VITE_SUPABASE_URL` | Supabase project URL | No |

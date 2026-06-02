@@ -8,14 +8,13 @@ import logging
 import threading
 import time
 import sqlite3
-import anthropic
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends, Request, Response
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from langchain_anthropic import ChatAnthropic
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.prompts import PromptTemplate
 from langchain_community.utilities import WikipediaAPIWrapper
 import subprocess
@@ -227,7 +226,7 @@ def audit_log_script(code: str, scene_idx: int, passed: bool, reason: str = "") 
         logger.warning(f"Could not write audit log: {e}")
 
 
-async def ask_claude_to_fix_manim(
+async def ask_gemini_to_fix_manim(
     topic: str,
     scene_idx: int,
     failed_code: str,
@@ -251,12 +250,12 @@ Rewrite so it compiles. Rules:
 
 Context: scene {scene_idx} of a lesson about "{topic}"."""
 
-    resp = anthropic_client.messages.create(
-        model="claude-3-7-sonnet-20250219",
-        max_tokens=2500,
-        messages=[{"role": "user", "content": fix_prompt}],
-    )
-    raw = resp.content[0].text.strip()
+    if not model:
+        raise ValueError("Gemini API model is not configured or unavailable.")
+
+    # Using model.ainvoke to execute Gemini API call asynchronously
+    resp = await model.ainvoke(fix_prompt)
+    raw = resp.content.strip()
     raw = re.sub(r"^```(?:python)?\n", "", raw)
     raw = re.sub(r"\n```$", "", raw)
     return raw.strip()
@@ -286,7 +285,7 @@ async def compile_scene_with_retry(
         if not is_safe:
             logger.warning(f"job={job_id} scene={scene_idx} attempt={attempt} AST blocked: {reason}")
             if attempt < MAX_MANIM_ATTEMPTS:
-                code = await ask_claude_to_fix_manim(
+                code = await ask_gemini_to_fix_manim(
                     topic, scene_idx, code, f"Safety violation: {reason}", attempt)
                 continue
             job_store.update(job_id, {"scene_warnings": f"scene {scene_idx}: placeholder after {MAX_MANIM_ATTEMPTS} AST violations"})
@@ -307,7 +306,7 @@ async def compile_scene_with_retry(
         error_text = result.stderr if result else "Timed out after 90 seconds"
         logger.warning(f"job={job_id} scene={scene_idx} attempt={attempt} failed: {error_text[-200:]}")
         if attempt < MAX_MANIM_ATTEMPTS:
-            code = await ask_claude_to_fix_manim(topic, scene_idx, code, error_text, attempt)
+            code = await ask_gemini_to_fix_manim(topic, scene_idx, code, error_text, attempt)
 
     logger.error(f"job={job_id} scene={scene_idx} all {MAX_MANIM_ATTEMPTS} attempts failed")
     job_store.update(job_id, {"scene_warnings": f"scene {scene_idx}: placeholder after {MAX_MANIM_ATTEMPTS} failed attempts"})
@@ -456,33 +455,34 @@ async def verify_firebase_token(request: Request, credentials: HTTPAuthorization
             detail=f"Invalid or expired Firebase ID token: {str(e)}"
         )
 
-anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-google_api_key = os.getenv("GOOGLE_API_KEY")
+gemini_api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "AIzaSyCGTV-hfbcGYqbXZdFSi_LkctKNsZUP7w4"
 
-if not anthropic_api_key:
-    raise ValueError("ANTHROPIC_API_KEY not found in environment variables or .env file")
+# Ensure keys are set in environment for child libraries
+os.environ["GOOGLE_API_KEY"] = gemini_api_key
+os.environ["GEMINI_API_KEY"] = gemini_api_key
 
-anthropic_client = anthropic.Anthropic(api_key=anthropic_api_key)
 PLACEHOLDER_VIDEO_URL = "https://storage.googleapis.com/lerno-998e4.appspot.com/placeholder.mp4"
 
-model = ChatAnthropic(
-    model_name="claude-3-7-sonnet-20250219",
-    anthropic_api_key=anthropic_api_key,
-    temperature=0.7,
-    max_tokens=4000
-)
+model = None
+try:
+    model = ChatGoogleGenerativeAI(
+        model="gemini-2.5-flash",
+        google_api_key=gemini_api_key,
+        temperature=0.7,
+        max_output_tokens=4000
+    )
+except Exception as e:
+    logger.error(f"Failed to initialize Gemini ChatGoogleGenerativeAI model: {e}")
+
+gemini_client = None
+try:
+    import google.generativeai as genai
+    genai.configure(api_key=gemini_api_key)
+    gemini_client = genai.GenerativeModel("gemini-2.5-flash")
+except Exception as e:
+    logger.error(f"Failed to initialize raw google.generativeai client: {e}")
 
 wikipedia = WikipediaAPIWrapper(top_k_results=2)
-
-use_gemini = False
-if google_api_key:
-    try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        gemini_model = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=google_api_key)
-        use_gemini = True
-    except (ImportError, Exception) as e:
-        print(f"Failed to initialize Gemini: {e}")
-        print("Will use Claude for classification instead.")
 
 STORYBOARD_PROMPT_TEMPLATE = PromptTemplate(
     input_variables=["audience", "topic", "wikipedia_info"],
@@ -644,9 +644,20 @@ def verify_child_safety(text: str) -> str:
         raise ValueError("AI output blocked: Content did not pass age-appropriate safety filter guidelines.")
     return text
 
+class GeminiUnavailableError(Exception):
+    """Raised when the Gemini API is not configured or fails to respond."""
+    pass
+
 def generate_response(prompt):
-    """Extract JSON from Claude's response with safety check"""
-    message = model.invoke(prompt)
+    """Extract JSON from Gemini's response with safety check and error handling"""
+    if not model:
+        raise GeminiUnavailableError("Gemini API is unavailable or not configured. Please check GEMINI_API_KEY.")
+    try:
+        message = model.invoke(prompt)
+    except Exception as e:
+        logger.error(f"Gemini API error during invocation: {e}")
+        raise GeminiUnavailableError(f"Gemini API is currently unavailable: {str(e)}")
+        
     text = verify_child_safety(message.content)
     json_match = re.search(r"\{.*\}", text, re.DOTALL)
     if json_match:
@@ -655,26 +666,19 @@ def generate_response(prompt):
         return ""
 
 def generate_response_raw(prompt):
-    """Get raw text response from Claude with safety check"""
-    message = model.invoke(prompt)
+    """Get raw text response from Gemini with safety check and error handling"""
+    if not model:
+        raise GeminiUnavailableError("Gemini API is unavailable or not configured. Please check GEMINI_API_KEY.")
+    try:
+        message = model.invoke(prompt)
+    except Exception as e:
+        logger.error(f"Gemini API error during raw invocation: {e}")
+        raise GeminiUnavailableError(f"Gemini API is currently unavailable: {str(e)}")
+        
     return verify_child_safety(message.content.strip())
 
 def classify_input(user_input):
-    """Classifies user input into topic and audience using Gemini if available, otherwise uses Claude."""
-    if use_gemini:
-        try:
-            prompt = f"""Classify the following input into a topic and audience. If no audience is provided, default to college student.
-            Return the response as a JSON object with "topic" and "audience" as keys.
-
-            Input: {user_input}
-            Output:
-            """
-            response = gemini_model.invoke(prompt)
-            result = json.loads(response.content)
-            return result
-        except Exception as e:
-            print(f"Error using Gemini for classification: {e}")
-    
+    """Classifies user input into topic and audience level using Gemini."""
     prompt = f"""Classify the following input into a topic to explain and an audience level. If no audience level is explicitly mentioned, default to "college student".
 
     Input: "{user_input}"
@@ -685,7 +689,10 @@ def classify_input(user_input):
         "audience": "high school students"
     }}
     """
-    
+    if not model:
+        logger.error("Gemini API is unavailable for classification.")
+        return {"topic": user_input, "audience": "college student"}
+        
     try:
         response = model.invoke(prompt)
         text = response.content
@@ -696,7 +703,7 @@ def classify_input(user_input):
         else:
             return {"topic": user_input, "audience": "college student"}
     except Exception as e:
-        print(f"Error classifying input: {e}")
+        logger.error(f"Error classifying input with Gemini: {e}")
         return {"topic": user_input, "audience": "college student"}
 
 def create_storyboard(audience, topic):

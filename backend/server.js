@@ -667,23 +667,20 @@ app.post("/api/gemini-chat", async (req, res) => {
   if (messages.length > 50) {
     return res.status(400).json({ error: "Too many messages — max 50" })
   }
+  // Allow up to 8000 chars per message — AI chatbot sends full lesson context + instructions
   const hasOversized = messages.some(
-    (m) => typeof m.content !== "string" || m.content.length > 2000
+    (m) => typeof m.content !== "string" || m.content.length > 8000
   )
   if (hasOversized) {
-    return res.status(400).json({ error: "A message exceeds the 2000 character limit" })
+    return res.status(400).json({ error: "A message exceeds the 8000 character limit" })
   }
 
   try {
     const { contents, generationConfig } = req.body;
-    const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.VITE_GEMINI_API_KEY;
-
-    if (!apiKey) {
-      return res.status(500).json({ error: "GEMINI_API_KEY not configured on server" });
-    }
+    const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.VITE_GEMINI_API_KEY || "AIzaSyCGTV-hfbcGYqbXZdFSi_LkctKNsZUP7w4";
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
       {
         contents,
         generationConfig: generationConfig || {
@@ -713,11 +710,7 @@ app.post("/api/gemini-chat", async (req, res) => {
 // ── Gemini-powered instant lesson generation (no Manim, results in seconds) ──
 app.post("/api/generate-lesson-gemini", requireAuth, lessonLimiter, validateLessonBody, async (req, res) => {
   const { topic } = req.body;
-  const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.VITE_GEMINI_API_KEY;
-
-  if (!apiKey) {
-    return res.status(500).json({ error: "GEMINI_API_KEY not configured on server" });
-  }
+  const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.VITE_GEMINI_API_KEY || "AIzaSyCGTV-hfbcGYqbXZdFSi_LkctKNsZUP7w4";
 
   const prompt = `You are an expert educational content creator for children aged 8-16. Generate a 3-scene visual lesson about: "${topic}"
 
@@ -788,7 +781,7 @@ Return ONLY valid JSON — no markdown fences, no explanation, nothing else:
 
   try {
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
       {
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: {
@@ -1175,15 +1168,7 @@ app.post("/api/multiplayer/moderate-chat", requireAuth, async (req, res) => {
     return res.status(400).json({ error: "message string is required" });
   }
   
-  const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.VITE_GEMINI_API_KEY;
-  if (!apiKey) {
-    console.warn("GEMINI_API_KEY not configured. Chat moderation will run in basic local regex mode.");
-    const sanitized = message
-      .replace(EMAIL_REGEX, '[REDACTED_EMAIL]')
-      .replace(PHONE_REGEX, '[REDACTED_PHONE]')
-      .replace(/\b(fuck|shit|bitch|asshole|cunt|dick)\b/gi, '****');
-    return res.json({ sanitized });
-  }
+  const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY || process.env.VITE_GEMINI_API_KEY || "AIzaSyCGTV-hfbcGYqbXZdFSi_LkctKNsZUP7w4";
   
   try {
     const prompt = `You are a strict child-safety content moderation system for an ed-tech learning app. Censor/redact any PII (names, emails, phone numbers, addresses) with [REDACTED]. Also censor any vulgarity, cyberbullying, or inappropriate words with stars (****). If the message is completely unsafe (hate speech, violence, severe abuse), replace the whole message with "[Blocked for safety]". Return ONLY the moderated text, no preamble or quotes.
@@ -1191,7 +1176,7 @@ app.post("/api/multiplayer/moderate-chat", requireAuth, async (req, res) => {
 Message to moderate: "${message}"`;
 
     const response = await axios.post(
-      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`,
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
       {
         contents: [
           {
@@ -1214,6 +1199,9 @@ Message to moderate: "${message}"`;
     res.json({ sanitized: sanitizedText });
   } catch (error) {
     console.error("Gemini chat moderation error:", error.message);
+    if (error.response) {
+      console.error("Gemini moderation error response:", JSON.stringify(error.response.data));
+    }
     const sanitized = message
       .replace(EMAIL_REGEX, '[REDACTED_EMAIL]')
       .replace(PHONE_REGEX, '[REDACTED_PHONE]');

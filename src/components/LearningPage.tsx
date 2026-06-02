@@ -1152,6 +1152,38 @@ const LearningPage = () => {
     );
   }
 
+  // Show a friendly error screen when lesson generation failed entirely
+  if (!loading && !jobId && FetchData.length === 0) {
+    return (
+      <div className="min-h-screen bg-black flex flex-col items-center justify-center text-white p-6">
+        <div className="max-w-md w-full text-center space-y-6">
+          <div className="w-16 h-16 mx-auto rounded-full bg-red-500/20 flex items-center justify-center">
+            <svg className="w-8 h-8 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M12 3a9 9 0 100 18A9 9 0 0012 3z" />
+            </svg>
+          </div>
+          <h2 className="text-2xl font-bold text-white">Lesson Generation Failed</h2>
+          <p className="text-neutral-400 text-sm leading-relaxed">
+            The AI could not generate your lesson. This is usually caused by a missing or invalid API key,
+            or the backend server is not running. Please check your <code className="text-purple-400">.env</code> file and try again.
+          </p>
+          <div className="p-4 bg-white/5 border border-white/10 rounded-xl text-left space-y-2">
+            <p className="text-xs font-semibold text-neutral-300">Common Fixes:</p>
+            <p className="text-xs text-neutral-400">• Set a valid <code className="text-yellow-400">GEMINI_API_KEY</code> or <code className="text-yellow-400">GOOGLE_API_KEY</code> in your .env</p>
+            <p className="text-xs text-neutral-400">• Make sure both servers are running</p>
+            <p className="text-xs text-neutral-400">• Restart after any .env changes</p>
+          </div>
+          <button
+            onClick={() => navigate("/chat")}
+            className="w-full py-3 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-sm font-semibold transition-all cursor-pointer"
+          >
+            ← Try Again
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <>
       <style>{`
