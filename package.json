@@ -1,8 +1,16 @@
 {
-  "name": "code-e-manipal-7-mod-3-",
+  "name": "lerno-ai",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
+  "description": "AI-powered adaptive learning platform with behavioral intelligence and real-time content generation",
+  "author": "Nikhil C",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nikhilc1910/lerno-ai.git"
+  },
+  "keywords": ["ai", "education", "edtech", "react", "fastapi", "typescript"],
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
