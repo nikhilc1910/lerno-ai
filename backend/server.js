@@ -158,7 +158,7 @@ class CustomRedisStore {
 // Global Rate Limiter
 const globalLimiter = rateLimit({
   windowMs: 60 * 1000,       // 1 minute window
-  max: 60,                   // 60 requests per minute total
+  max: 300,                  // 300 requests per minute total
   standardHeaders: true,
   store: new CustomRedisStore("rl:global", 60 * 1000),
   message: { error: 'Too many requests, slow down.' }
