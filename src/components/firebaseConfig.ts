@@ -2,6 +2,7 @@ import { initializeApp } from "firebase/app";
 import { getAuth, GoogleAuthProvider } from "firebase/auth";
 import { getFirestore } from "firebase/firestore";
 import { getStorage } from "firebase/storage";
+import { getAnalytics, isSupported } from "firebase/analytics";
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
@@ -12,17 +13,18 @@ const firebaseConfig = {
   appId: import.meta.env.VITE_FIREBASE_APP_ID,
   measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID,
 };
-// Initialize Firebase
+
 const app = initializeApp(firebaseConfig);
 
-// Auth (Email/Password & Google)
 export const auth = getAuth(app);
-export const googleProvider = new GoogleAuthProvider();
-
-// Firestore Database
 export const db = getFirestore(app);
-
-// Storage
+export const googleProvider = new GoogleAuthProvider();
 export const storage = getStorage(app);
+
+isSupported().then((yes) => {
+  if (yes) {
+    getAnalytics(app);
+  }
+});
 
 export default app;

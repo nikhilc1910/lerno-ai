@@ -7,6 +7,7 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
+# Dependencies
 node_modules
 dist
 dist-ssr
@@ -24,10 +25,20 @@ dist-ssr
 *.sw?
 .env4
 .env
+
+# Python envs
 backend/venv/
 backend/.venv/
 .venv/
 venv/
 __pycache__/
 *.pyc
+
+# Local Credentials and DBs
 backend/lerno-998e4-firebase-adminsdk-fbsvc-736e959000.json
+backend/*.json
+backend/narrations/
+backend/reports/
+backend/*.db
+*.db
+.agents/

@@ -30,4 +30,7 @@ pygments>=2.16.1
 tqdm>=4.66.1
 
 # Prevent watchfiles automatic reload
-watchfiles>=0.20.0 
+watchfiles>=0.20.0
+
+# ElevenLabs Integration
+elevenlabs>=2.49.0 

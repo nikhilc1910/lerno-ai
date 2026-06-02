@@ -4,14 +4,15 @@ import type React from "react";
 import { useState, type ChangeEvent } from "react";
 import { Eye, EyeOff, Mail, Lock, ArrowRight } from "lucide-react";
 import { useNavigate } from "react-router-dom";
-import { auth, db } from "./firebaseConfig"; // Match the path from signup
+import { auth, db, googleProvider } from "./firebaseConfig"; // Match the path from signup
 import {
   signInWithEmailAndPassword,
   signInWithPopup,
-  GoogleAuthProvider,
 } from "firebase/auth";
 import { doc, getDoc, setDoc } from "firebase/firestore";
 import { SparklesCore } from "@/ui/sparkles";
+import axios from "axios";
+import { setAccessToken } from "../services/apiClient";
 
 const Login: React.FC = () => {
   const [showPassword, setShowPassword] = useState<boolean>(false);
@@ -31,16 +32,45 @@ const Login: React.FC = () => {
     setError("");
 
     try {
-      await signInWithEmailAndPassword(
+      console.log("TRACE: starting handleLogin for email:", email);
+      const userCredential = await signInWithEmailAndPassword(
         auth,
         email,
         password
       );
+      const user = userCredential.user;
+      console.log("TRACE 1: Firebase User Object (Email Login):", JSON.stringify({
+        uid: user.uid,
+        email: user.email,
+        displayName: user.displayName,
+        emailVerified: user.emailVerified
+      }, null, 2));
+
+      console.log("TRACE: retrieving Firebase ID Token...");
+      const firebaseToken = await user.getIdToken();
+      console.log("TRACE 2: Firebase ID token retrieval status: SUCCESS. Token length:", firebaseToken ? firebaseToken.length : 0);
+      
+      const payload = {};
+      const headers = { Authorization: `Bearer ${firebaseToken}` };
+      console.log("TRACE 3: Session endpoint request payload:", JSON.stringify(payload), "Headers keys:", Object.keys(headers));
+
+      console.log("TRACE: sending POST to /api/auth/session...");
+      const response = await axios.post("/api/auth/session", payload, { headers });
+      console.log("TRACE 4: Session endpoint response status:", response.status, "data:", JSON.stringify(response.data, null, 2));
+      
+      const { accessToken } = response.data;
+      console.log("TRACE: setting access token. Length:", accessToken ? accessToken.length : 0);
+      setAccessToken(accessToken);
+      
+      console.log("TRACE 7: Redirecting to /chat");
       navigate("/chat");
-    } catch (err: unknown) {
-      console.error("Login error:", err);
-      const errorCode = (err && typeof err === "object" && "code" in err) ? (err as { code: string }).code : "";
-      setError(getErrorMessage(errorCode));
+    } catch (err: any) {
+      console.error("TRACE 8: Exact stack trace / exception in handleLogin:", err);
+      if (err.response) {
+        console.error("TRACE 8: Response error details status:", err.response.status, "data:", JSON.stringify(err.response.data));
+      }
+      const errorCode = err?.code || "";
+      setError(getErrorMessage(errorCode) || err.message || "Login failed");
     } finally {
       setIsLoading(false);
     }
@@ -51,16 +81,38 @@ const Login: React.FC = () => {
     setError("");
 
     try {
-      const provider = new GoogleAuthProvider();
-      const result = await signInWithPopup(auth, provider);
+      console.log("TRACE: starting handleGoogleLogin via signInWithPopup...");
+      const result = await signInWithPopup(auth, googleProvider);
       const user = result.user;
+      console.log("TRACE 1: Firebase User Object (Google Login):", JSON.stringify({
+        uid: user.uid,
+        email: user.email,
+        displayName: user.displayName,
+        photoURL: user.photoURL
+      }, null, 2));
 
-      // Check if user exists in Firestore, if not create basic profile
+      console.log("TRACE: retrieving Firebase ID Token...");
+      const firebaseToken = await user.getIdToken();
+      console.log("TRACE 2: Firebase ID token retrieval status: SUCCESS. Token length:", firebaseToken ? firebaseToken.length : 0);
+
+      const payload = {};
+      const headers = { Authorization: `Bearer ${firebaseToken}` };
+      console.log("TRACE 3: Session endpoint request payload:", JSON.stringify(payload), "Headers keys:", Object.keys(headers));
+
+      console.log("TRACE: sending POST to /api/auth/session...");
+      const response = await axios.post("/api/auth/session", payload, { headers });
+      console.log("TRACE 4: Session endpoint response status:", response.status, "data:", JSON.stringify(response.data, null, 2));
+      
+      const { accessToken } = response.data;
+      console.log("TRACE: setting access token. Length:", accessToken ? accessToken.length : 0);
+      setAccessToken(accessToken);
+
+      console.log("TRACE: checking if user exists in Firestore...");
       const userDoc = doc(db, "users", user.uid);
       const userSnapshot = await getDoc(userDoc);
 
       if (!userSnapshot.exists()) {
-        // Create user document if it doesn't exist
+        console.log("TRACE: User doc does not exist in Firestore. Creating doc for uid:", user.uid);
         await setDoc(userDoc, {
           uid: user.uid,
           email: user.email,
@@ -72,13 +124,20 @@ const Login: React.FC = () => {
           maxTopicRequests: 10,
           photoURL: user.photoURL,
         });
+        console.log("TRACE: User doc created in Firestore successfully.");
+      } else {
+        console.log("TRACE: User doc already exists in Firestore.");
       }
 
+      console.log("TRACE 7: Redirecting to /chat");
       navigate("/chat");
-    } catch (err: unknown) {
-      console.error("Google login error:", err);
-      const errorCode = (err && typeof err === "object" && "code" in err) ? (err as { code: string }).code : "";
-      setError(getErrorMessage(errorCode));
+    } catch (err: any) {
+      console.error("TRACE 8: Exact stack trace / exception in handleGoogleLogin:", err);
+      if (err.response) {
+        console.error("TRACE 8: Response error details status:", err.response.status, "data:", JSON.stringify(err.response.data));
+      }
+      const errorCode = err?.code || "";
+      setError(getErrorMessage(errorCode) || err.message || "Google Login failed");
     } finally {
       setIsLoading(false);
     }
@@ -259,12 +318,12 @@ const Login: React.FC = () => {
           </button>
 
           {/* Sign up link */}
-          <div className="text-center mt-8">
-            <p className="text-gray-400">
+          <div className="text-center mt-8 text-gray-400">
+            <p>
               {"Don't have an account? "}
               <button
                 onClick={() => navigate("/signup")}
-                className="text-gray-300 hover:text-white transition-colors cursor-pointer underline"
+                className="text-gray-300 hover:text-white transition-colors cursor-pointer underline font-semibold"
               >
                 Sign up now
               </button>

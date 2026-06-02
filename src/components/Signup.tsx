@@ -3,31 +3,74 @@
 import type React from "react";
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { User, Mail, Lock, ArrowRight } from "lucide-react";
+import { User, Mail, Lock, ArrowRight, Calendar } from "lucide-react";
 import {
   createUserWithEmailAndPassword,
   signInWithPopup,
-  GoogleAuthProvider,
   updateProfile,
 } from "firebase/auth";
 import { doc, setDoc } from "firebase/firestore";
-import { auth, db } from "./firebaseConfig"; // Adjust path as needed
+import { auth, db, googleProvider } from "./firebaseConfig"; // Adjust path as needed
 import { SparklesCore } from "@/ui/sparkles";
+import axios from "axios";
+import { setAccessToken } from "../services/apiClient";
 
 const SignUp: React.FC = () => {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
+  const [dob, setDob] = useState("");
+  const [parentConsent, setParentConsent] = useState(false);
+  const [showConsent, setShowConsent] = useState(false);
   const [error, setError] = useState<string>("");
   const [isLoading, setIsLoading] = useState(false);
   const navigate = useNavigate();
+
+  const handleDobChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const value = e.target.value;
+    setDob(value);
+    if (value) {
+      const today = new Date();
+      const birthDate = new Date(value);
+      let age = today.getFullYear() - birthDate.getFullYear();
+      const m = today.getMonth() - birthDate.getMonth();
+      if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) {
+        age--;
+      }
+      setShowConsent(age < 13);
+    } else {
+      setShowConsent(false);
+    }
+  };
 
   const handleSignUp = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsLoading(true);
     setError("");
 
+    if (!name || !email || !password || !dob) {
+      setError("Please fill in all fields");
+      setIsLoading(false);
+      return;
+    }
+
+    // Calculate age for COPPA validation
+    const today = new Date();
+    const birthDate = new Date(dob);
+    let age = today.getFullYear() - birthDate.getFullYear();
+    const m = today.getMonth() - birthDate.getMonth();
+    if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) {
+      age--;
+    }
+
+    if (age < 13 && !parentConsent) {
+      setError("Under-13 accounts require verified parental consent to register. Please have a parent review and check the consent box.");
+      setIsLoading(false);
+      return;
+    }
+
     try {
+      console.log("TRACE: starting handleSignUp for email:", email);
       // Create user with Firebase Auth
       const userCredential = await createUserWithEmailAndPassword(
         auth,
@@ -35,12 +78,36 @@ const SignUp: React.FC = () => {
         password
       );
       const user = userCredential.user;
+      console.log("TRACE 1: Firebase User Object (Email Signup):", JSON.stringify({
+        uid: user.uid,
+        email: user.email,
+        displayName: name
+      }, null, 2));
 
+      console.log("TRACE: updating profile displayName...");
       // Update user profile with display name
       await updateProfile(user, {
         displayName: name,
       });
 
+      console.log("TRACE: retrieving Firebase ID Token...");
+      // Exchange Firebase Token for local custom JWT session
+      const firebaseToken = await user.getIdToken();
+      console.log("TRACE 2: Firebase ID token retrieval status: SUCCESS. Token length:", firebaseToken ? firebaseToken.length : 0);
+
+      const payload = {};
+      const headers = { Authorization: `Bearer ${firebaseToken}` };
+      console.log("TRACE 3: Session endpoint request payload:", JSON.stringify(payload), "Headers keys:", Object.keys(headers));
+
+      console.log("TRACE: sending POST to /api/auth/session...");
+      const response = await axios.post("/api/auth/session", payload, { headers });
+      console.log("TRACE 4: Session endpoint response status:", response.status, "data:", JSON.stringify(response.data, null, 2));
+
+      const { accessToken } = response.data;
+      console.log("TRACE: setting access token. Length:", accessToken ? accessToken.length : 0);
+      setAccessToken(accessToken);
+
+      console.log("TRACE: creating user profile document in Firestore...");
       // Store additional user data in Firestore
       await setDoc(doc(db, "users", user.uid), {
         uid: user.uid,
@@ -50,13 +117,20 @@ const SignUp: React.FC = () => {
         isPro: false,
         topicRequestsUsed: 0,
         maxTopicRequests: 10,
+        dateOfBirth: dob,
+        parentalConsentVerified: age < 13 ? parentConsent : true,
       });
+      console.log("TRACE: User doc created in Firestore successfully.");
 
-      navigate("/login");
-    } catch (err: unknown) {
-      console.error("Signup error:", err);
-      const errorCode = (err && typeof err === "object" && "code" in err) ? (err as { code: string }).code : "";
-      setError(getErrorMessage(errorCode));
+      console.log("TRACE 7: Redirecting to /chat");
+      navigate("/chat");
+    } catch (err: any) {
+      console.error("TRACE 8: Exact stack trace / exception in handleSignUp:", err);
+      if (err.response) {
+        console.error("TRACE 8: Response error details status:", err.response.status, "data:", JSON.stringify(err.response.data));
+      }
+      const errorCode = err?.code || "";
+      setError(getErrorMessage(errorCode) || err.message || "Signup failed");
     } finally {
       setIsLoading(false);
     }
@@ -67,10 +141,34 @@ const SignUp: React.FC = () => {
     setError("");
 
     try {
-      const provider = new GoogleAuthProvider();
-      const result = await signInWithPopup(auth, provider);
+      console.log("TRACE: starting handleGoogleSignUp via signInWithPopup...");
+      const result = await signInWithPopup(auth, googleProvider);
       const user = result.user;
+      console.log("TRACE 1: Firebase User Object (Google Signup):", JSON.stringify({
+        uid: user.uid,
+        email: user.email,
+        displayName: user.displayName,
+        photoURL: user.photoURL
+      }, null, 2));
 
+      console.log("TRACE: retrieving Firebase ID Token...");
+      // Exchange Firebase Token for local custom JWT session
+      const firebaseToken = await user.getIdToken();
+      console.log("TRACE 2: Firebase ID token retrieval status: SUCCESS. Token length:", firebaseToken ? firebaseToken.length : 0);
+
+      const payload = {};
+      const headers = { Authorization: `Bearer ${firebaseToken}` };
+      console.log("TRACE 3: Session endpoint request payload:", JSON.stringify(payload), "Headers keys:", Object.keys(headers));
+
+      console.log("TRACE: sending POST to /api/auth/session...");
+      const response = await axios.post("/api/auth/session", payload, { headers });
+      console.log("TRACE 4: Session endpoint response status:", response.status, "data:", JSON.stringify(response.data, null, 2));
+
+      const { accessToken } = response.data;
+      console.log("TRACE: setting access token. Length:", accessToken ? accessToken.length : 0);
+      setAccessToken(accessToken);
+
+      console.log("TRACE: creating / checking user profile document in Firestore...");
       // Check if this is a new user and store additional data
       const userDoc = doc(db, "users", user.uid);
       await setDoc(
@@ -86,13 +184,18 @@ const SignUp: React.FC = () => {
           photoURL: user.photoURL,
         },
         { merge: true }
-      ); // merge: true won't overwrite existing data
+      );
+      console.log("TRACE: User doc merged in Firestore successfully.");
 
-      navigate("/login");
-    } catch (err: unknown) {
-      console.error("Google signup error:", err);
-      const errorCode = (err && typeof err === "object" && "code" in err) ? (err as { code: string }).code : "";
-      setError(getErrorMessage(errorCode));
+      console.log("TRACE 7: Redirecting to /chat");
+      navigate("/chat");
+    } catch (err: any) {
+      console.error("TRACE 8: Exact stack trace / exception in handleGoogleSignUp:", err);
+      if (err.response) {
+        console.error("TRACE 8: Response error details status:", err.response.status, "data:", JSON.stringify(err.response.data));
+      }
+      const errorCode = err?.code || "";
+      setError(getErrorMessage(errorCode) || err.message || "Google signup failed");
     } finally {
       setIsLoading(false);
     }
@@ -200,6 +303,43 @@ const SignUp: React.FC = () => {
               </div>
             </div>
 
+            {/* Date of Birth field */}
+            <div className="relative">
+              <label className="block text-sm font-semibold text-gray-300 mb-2">
+                Date of Birth
+              </label>
+              <div className="relative">
+                <Calendar className="absolute left-4 top-1/2 transform -translate-y-1/2 w-5 h-5 text-gray-400 z-10 pointer-events-none" />
+                <input
+                  type="date"
+                  value={dob}
+                  onChange={handleDobChange}
+                  className="w-full pl-12 pr-4 py-4 bg-[#191919]/80 backdrop-blur-sm border border-[#333333] rounded-2xl text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-gray-600 focus:border-gray-600 transition-all duration-300 relative z-0"
+                  required
+                />
+              </div>
+            </div>
+
+            {/* COPPA Gated Parental Consent Checkbox */}
+            {showConsent && (
+              <div className="p-4 bg-indigo-500/10 border border-indigo-500/20 rounded-2xl space-y-3 backdrop-blur-sm">
+                <p className="text-xs text-indigo-300 leading-relaxed">
+                  📢 <strong>COPPA Gating Notice:</strong> Since you are under 13, a parent must explicitly check this box to confirm consent for telemetry tracking and learning personalization.
+                </p>
+                <label className="flex items-start space-x-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={parentConsent}
+                    onChange={(e) => setParentConsent(e.target.checked)}
+                    className="w-5 h-5 mt-0.5 rounded border-[#333333] bg-[#191919]/80 accent-indigo-500"
+                  />
+                  <span className="text-sm text-gray-300 leading-snug select-none">
+                    I confirm that my parent has consented to my use of Lerno.ai and personalized telemetry tracking.
+                  </span>
+                </label>
+              </div>
+            )}
+
             {/* Error message */}
             {error && (
               <div className="p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400 text-sm backdrop-blur-sm">
@@ -268,8 +408,8 @@ const SignUp: React.FC = () => {
           </button>
 
           {/* Sign in link */}
-          <div className="text-center mt-8">
-            <p className="text-gray-400">
+          <div className="text-center mt-8 text-gray-400">
+            <p>
               Already have an account?{" "}
               <button
                 onClick={() => navigate("/login")}

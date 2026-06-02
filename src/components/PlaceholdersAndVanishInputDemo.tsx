@@ -11,6 +11,24 @@ export default function PlaceholdersAndVanishInputDemo() {
   const [inputValue, setInputValue] = React.useState("");
   const [isLoading, setIsLoading] = useState(false);
 
+  React.useEffect(() => {
+    const checkProfile = async () => {
+      try {
+        const backendUrl = import.meta.env.VITE_BACKEND_URL || "http://localhost:3001";
+        const res = await authFetch(`${backendUrl}/api/profile`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data && data.exists === false) {
+            navigate("/onboarding");
+          }
+        }
+      } catch (err) {
+        console.error("Error checking profile:", err);
+      }
+    };
+    checkProfile();
+  }, [navigate]);
+
   const placeholders = [
     'I am "audience" teach me this "topic"?',
     "Explain the Pythagorean Theorem with animation",
@@ -19,9 +37,10 @@ export default function PlaceholdersAndVanishInputDemo() {
     "Give a visual explanation of linear transformations in 3D",
   ];
   const loadingStates = [
-    { text: "Finding personalized learning topics..." },
-    { text: "Generating educational content..." },
-    { text: "Preparing your learning experience..." },
+    { text: "Understanding your topic..." },
+    { text: "Building scenes with Gemini AI..." },
+    { text: "Crafting questions for you..." },
+    { text: "Almost ready..." },
   ];
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -57,31 +76,48 @@ export default function PlaceholdersAndVanishInputDemo() {
 
     try {
       const backendUrl = import.meta.env.VITE_BACKEND_URL || "http://localhost:3001";
-      const response = await authFetch(`${backendUrl}/api/input-data`, {
+
+      // ── Primary path: Gemini instant lesson generation (seconds, no Manim) ──
+      const geminiResponse = await authFetch(`${backendUrl}/api/generate-lesson-gemini`, {
         method: "POST",
-        body: JSON.stringify({ topic: topic, data: topic }),
+        body: JSON.stringify({ topic }),
       });
-      const resData = await response.json();
 
-      const jobId = resData.response?.job_id;
+      if (geminiResponse.ok) {
+        const geminiData = await geminiResponse.json();
+        const scenes = geminiData.scenes || [];
 
-      if (jobId) {
-        navigate("/learning", {
-          state: {
-            query: inputValue,
-            jobId: jobId,
-          },
-        });
-      } else {
-        navigate("/learning", {
-          state: {
-            query: inputValue,
-            responseData: resData.response?.data?.scenes || [],
-          },
-        });
+        if (scenes.length > 0) {
+          navigate("/learning", {
+            state: {
+              query: inputValue,
+              responseData: scenes,
+              metadata: geminiData.metadata,
+            },
+          });
+          return;
+        }
       }
+
+      // ── Fallback path: Manim async pipeline (if Gemini fails) ──
+      console.warn("Gemini generation failed, falling back to Manim pipeline...");
+      const maninResponse = await authFetch(`${backendUrl}/api/input-data`, {
+        method: "POST",
+        body: JSON.stringify({ topic, data: topic }),
+      });
+      const maninData = await maninResponse.json();
+      const jobId = maninData.response?.job_id;
+
+      navigate("/learning", {
+        state: {
+          query: inputValue,
+          jobId: jobId || null,
+          responseData: maninData.response?.data?.scenes || [],
+        },
+      });
     } catch (error) {
-      console.log("The error is " + error);
+      console.error("Lesson generation error:", error);
+      toast.error("Could not generate lesson. Check your connection and try again.");
       setIsLoading(false);
     }
   };

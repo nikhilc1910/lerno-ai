@@ -4,15 +4,15 @@ import AIChatbot from "./AIChatbot";
 import { HoverBorderGradient } from "@/ui/hover-border-gradient";
 import { AnimatedShinyText } from "@/ui/animated-shiny-text";
 import { cn } from "@/lib/utils";
-import { useLocation } from "react-router-dom";
+import { useLocation, useNavigate } from "react-router-dom";
 import { motion, AnimatePresence, type Variants } from "framer-motion";
 import { ref, getDownloadURL, listAll } from "firebase/storage";
-import { doc, setDoc, getDoc } from "firebase/firestore";
+import { doc, setDoc, getDoc, collection, onSnapshot, query, where, deleteDoc, addDoc, updateDoc, increment } from "firebase/firestore";
 import { storage, db } from "./firebaseConfig";
 import { authFetch } from "../lib/api";
 import { FiChevronDown, FiX, FiSave, FiEdit3, FiTrash2 } from "react-icons/fi";
 import { FloatingDock } from "@/ui/floating-dock";
-import { Phone, BookOpen } from "lucide-react";
+import { Phone, BookOpen, Sparkles } from "lucide-react";
 
 // MURF_API_KEY consolidated to backend
 
@@ -75,8 +75,12 @@ const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:3001";
 
 const LearningPage = () => {
   const location = useLocation();
+  const navigate = useNavigate();
   const [videoURLs, setVideoURLs] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
+  const [boredomScore, setBoredomScore] = useState(0);
+  const [showBoredomOverlay, setShowBoredomOverlay] = useState(false);
+  const [isUpdatingPacing, setIsUpdatingPacing] = useState(false);
 
   // Async job rendering state variables
   const [jobId, setJobId] = useState<string | null>(location.state?.jobId || null);
@@ -84,6 +88,265 @@ const LearningPage = () => {
   const [jobMessage, setJobMessage] = useState<string>("Initializing...");
   const [lessonsData, setLessonsData] = useState<SceneData[]>(location.state?.responseData || []);
   const [jobError, setJobError] = useState<string | null>(null);
+  const [audioProvider, setAudioProvider] = useState<"elevenlabs" | "murf">("elevenlabs");
+  const [worldState, setWorldState] = useState<any>(null);
+  const [isAudioPlaying, setIsAudioPlaying] = useState(false);
+
+  // Gamification states
+  const [totalXP, setTotalXP] = useState<number>(0);
+  const [userLevel, setUserLevel] = useState<number>(1);
+  const [leaderboard, setLeaderboard] = useState<any[]>([]);
+  const [userRank, setUserRank] = useState<number>(0);
+  const [isLeaderboardOpen, setIsLeaderboardOpen] = useState<boolean>(true);
+
+  const fetchLeaderboardAndXP = async () => {
+    try {
+      const response = await authFetch(`${BACKEND_URL}/api/leaderboard`);
+      if (response.ok) {
+        const data = await response.json();
+        setLeaderboard(data.leaderboard || []);
+        setUserRank(data.user_rank || 0);
+        const xp = data.user_score || 0;
+        setTotalXP(xp);
+        setUserLevel(Math.floor(xp / 100) + 1);
+      }
+    } catch (err) {
+      console.error("Error loading leaderboard and XP:", err);
+    }
+  };
+
+  // Multiplayer & Co-op States
+  const [onlinePeers, setOnlinePeers] = useState<string[]>([]);
+  const [lobbies, setLobbies] = useState<any[]>([]);
+  const [currentLobbyId, setCurrentLobbyId] = useState<string | null>(null);
+  const [lobbyState, setLobbyState] = useState<any>(null);
+  const [chatMessages, setChatMessages] = useState<any[]>([]);
+  const [typedMessage, setTypedMessage] = useState<string>("");
+  const [isLobbyPanelOpen, setIsLobbyPanelOpen] = useState<boolean>(true);
+  const [newLobbyName, setNewLobbyName] = useState<string>("");
+
+  // Multiplayer Actions
+  const createLobby = async () => {
+    if (!newLobbyName.trim()) return;
+    const userId = getCurrentUserId();
+    try {
+      const docRef = await addDoc(collection(db, "lobbies"), {
+        name: newLobbyName,
+        members: [userId],
+        bossName: "Math Kraken",
+        bossMaxHp: 100,
+        bossHp: 100,
+        status: "active",
+        createdAt: Date.now()
+      });
+      setCurrentLobbyId(docRef.id);
+      setNewLobbyName("");
+    } catch (err) {
+      console.error("Error creating lobby:", err);
+    }
+  };
+
+  const joinLobby = async (lobbyId: string) => {
+    const userId = getCurrentUserId();
+    const lobbyRef = doc(db, "lobbies", lobbyId);
+    try {
+      const docSnap = await getDoc(lobbyRef);
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (!data.members.includes(userId)) {
+          await updateDoc(lobbyRef, {
+            members: [...data.members, userId]
+          });
+        }
+        setCurrentLobbyId(lobbyId);
+      }
+    } catch (err) {
+      console.error("Error joining lobby:", err);
+    }
+  };
+
+  const leaveLobby = async () => {
+    if (!currentLobbyId) return;
+    const userId = getCurrentUserId();
+    const lobbyRef = doc(db, "lobbies", currentLobbyId);
+    try {
+      const docSnap = await getDoc(lobbyRef);
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        const updatedMembers = data.members.filter((uid: string) => uid !== userId);
+        if (updatedMembers.length === 0) {
+          await deleteDoc(lobbyRef);
+        } else {
+          await updateDoc(lobbyRef, {
+            members: updatedMembers
+          });
+        }
+      }
+      setCurrentLobbyId(null);
+      setLobbyState(null);
+      setChatMessages([]);
+    } catch (err) {
+      console.error("Error leaving lobby:", err);
+    }
+  };
+
+  const sendChatMessage = async () => {
+    if (!typedMessage.trim() || !currentLobbyId) return;
+    const userId = getCurrentUserId();
+    const textToSend = typedMessage;
+    setTypedMessage("");
+    try {
+      const response = await authFetch(`${BACKEND_URL}/api/multiplayer/moderate-chat`, {
+        method: "POST",
+        body: JSON.stringify({ message: textToSend })
+      });
+      if (response.ok) {
+        const data = await response.json();
+        await addDoc(collection(db, "lobby_messages"), {
+          lobbyId: currentLobbyId,
+          senderId: userId,
+          text: data.sanitized,
+          timestamp: Date.now()
+        });
+      }
+    } catch (err) {
+      console.error("Error sending chat message:", err);
+    }
+  };
+
+  const handleBossDefeat = async (lobbyData: any) => {
+    if (lobbyData.status !== "active") return;
+    const lobbyRef = doc(db, "lobbies", lobbyData.id);
+    try {
+      await updateDoc(lobbyRef, { status: "defeated" });
+      const response = await authFetch(`${BACKEND_URL}/api/multiplayer/boss-rewards`, {
+        method: "POST",
+        body: JSON.stringify({ user_ids: lobbyData.members })
+      });
+      if (response.ok) {
+        alert("🎉 Cooperative Boss Defeated! Every member of the lobby was awarded +100 XP!");
+        fetchLeaderboardAndXP();
+      }
+    } catch (err) {
+      console.error("Error handling boss defeat rewards:", err);
+    }
+  };
+
+  // Presence and general Firestore subscriptions
+  useEffect(() => {
+    const userId = getCurrentUserId();
+    const presenceRef = doc(db, "presence", userId);
+
+    const markOnline = async () => {
+      try {
+        await setDoc(presenceRef, { userId, online: true, lastActive: Date.now() }, { merge: true });
+      } catch (err) {
+        console.error("Error setting presence:", err);
+      }
+    };
+    markOnline();
+
+    const presenceQuery = query(collection(db, "presence"));
+    const unsubPresence = onSnapshot(presenceQuery, (snapshot) => {
+      const peers: string[] = [];
+      snapshot.forEach((docSnap) => {
+        const data = docSnap.data();
+        if (data.userId && data.userId !== userId && data.online) {
+          peers.push(data.userId);
+        }
+      });
+      setOnlinePeers(peers);
+    });
+
+    const lobbiesQuery = query(collection(db, "lobbies"));
+    const unsubLobbies = onSnapshot(lobbiesQuery, (snapshot) => {
+      const activeLobbies: any[] = [];
+      snapshot.forEach((docSnap) => {
+        activeLobbies.push({ id: docSnap.id, ...docSnap.data() });
+      });
+      setLobbies(activeLobbies);
+    });
+
+    const handleCleanup = async () => {
+      try {
+        await deleteDoc(presenceRef);
+      } catch (err) {
+        console.error("Error clearing presence:", err);
+      }
+    };
+
+    window.addEventListener("beforeunload", handleCleanup);
+
+    return () => {
+      handleCleanup();
+      unsubPresence();
+      unsubLobbies();
+      window.removeEventListener("beforeunload", handleCleanup);
+    };
+  }, []);
+
+  // Active Lobby Sync
+  useEffect(() => {
+    if (!currentLobbyId) return;
+
+    const lobbyRef = doc(db, "lobbies", currentLobbyId);
+    const unsubLobbyDoc = onSnapshot(lobbyRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data: any = { id: docSnap.id, ...docSnap.data() };
+        setLobbyState(data);
+        if (data.bossHp <= 0 && data.status === "active") {
+          handleBossDefeat(data);
+        }
+      }
+    });
+
+    const chatQuery = query(
+      collection(db, "lobby_messages"),
+      where("lobbyId", "==", currentLobbyId)
+    );
+    const unsubChat = onSnapshot(chatQuery, (snapshot) => {
+      const msgs: any[] = [];
+      snapshot.forEach((docSnap) => {
+        msgs.push({ id: docSnap.id, ...docSnap.data() });
+      });
+      msgs.sort((a, b) => a.timestamp - b.timestamp);
+      setChatMessages(msgs);
+    });
+
+    return () => {
+      unsubLobbyDoc();
+      unsubChat();
+    };
+  }, [currentLobbyId]);
+
+  // Log boredom score when it changes to satisfy TS unused check
+  useEffect(() => {
+    console.log("Active boredom score updated:", boredomScore);
+  }, [boredomScore]);
+
+  // Use actual generated lesson data — no hardcoded fallback so the wrong topic never shows
+  const FetchData = lessonsData;
+
+  const [selectedAnswerIndex, setSelectedAnswerIndex] = useState<number | null>(
+    null
+  );
+  const [hasAnswered, setHasAnswered] = useState(false);
+  const [currentSlideIndex, setCurrentSlideIndex] = useState(0);
+  const [currentVideoIndex, setCurrentVideoIndex] = useState(0);
+
+  //Narration Logic
+  const [narrationWords, setNarrationWords] = useState<string[]>([]);
+  const [currentWordIndex, setCurrentWordIndex] = useState<number>(-1);
+
+  // Safe current slide — empty placeholder if data hasn't loaded yet
+  const EMPTY_SLIDE: SceneData = {
+    title: "Loading...",
+    assessment: { multiple_choice: { question: "", choices: [], correct_index: 0 } },
+  };
+  const currentSlide = FetchData[currentSlideIndex] ?? FetchData[0] ?? EMPTY_SLIDE;
+  const answer = currentSlide.assessment.multiple_choice.choices;
+  const question = currentSlide.assessment.multiple_choice.question;
+  const correctAnswerIndex = currentSlide.assessment.multiple_choice.correct_index;
 
   const lessonsDataRef = useRef<SceneData[]>(lessonsData);
   lessonsDataRef.current = lessonsData;
@@ -184,9 +447,25 @@ const LearningPage = () => {
     };
   }, [jobId]);
 
-  // Load notes when component mounts
+  const loadWorldState = async () => {
+    try {
+      const response = await authFetch(`${BACKEND_URL}/api/world/state`);
+      if (response.ok) {
+        const data = await response.json();
+        if (data.exists) {
+          setWorldState(data.world);
+        }
+      }
+    } catch (err) {
+      console.error("Error loading world state:", err);
+    }
+  };
+
+  // Load notes and world state when component mounts
   useEffect(() => {
     loadNotes();
+    loadWorldState();
+    fetchLeaderboardAndXP();
   }, []);
 
   // Add this useEffect after the existing useEffects, around line 120
@@ -202,45 +481,126 @@ const LearningPage = () => {
     };
   }, []);
 
-  const FetchData = lessonsData.length > 0 ? lessonsData : [
-    {
-      title: "Introduction to Vectors",
-      assessment: {
-        multiple_choice: {
-          question: "What is the primary purpose of vectors in computing?",
-          choices: [
-            "A. Data storage only",
-            "B. Mathematical operations and graphics",
-            "C. Text processing",
-            "D. Audio manipulation",
-          ],
-          correct_index: 1,
-        },
-      },
-      narration:
-        "Vectors are a fundamental concept in computing, especially in graphics programming and mathematical operations.",
-    },
-  ];
+  // Boredom checker effect
+  useEffect(() => {
+    if (loading || showBoredomOverlay) return;
 
-  const [selectedAnswerIndex, setSelectedAnswerIndex] = useState<number | null>(
-    null
-  );
-  const [hasAnswered, setHasAnswered] = useState(false);
-  const [currentSlideIndex, setCurrentSlideIndex] = useState(0);
-  const [currentVideoIndex, setCurrentVideoIndex] = useState(0);
+    const checkBoredom = async () => {
+      try {
+        const response = await authFetch(`${BACKEND_URL}/api/boredom-check`);
+        if (response.ok) {
+          const data = await response.json();
+          setBoredomScore(data.boredom_score);
+          if (data.requires_intervention) {
+            setShowBoredomOverlay(true);
+            authFetch(`${BACKEND_URL}/api/milestones`, {
+              method: "POST",
+              body: JSON.stringify({
+                milestone_type: "failed_concept",
+                concept_id: currentSlide.title,
+                description: `Boredom threshold exceeded: ${data.boredom_score}`,
+                associated_sentiment: -0.5
+              })
+            }).catch(e => console.error("Milestone tracking error:", e));
+          }
+        }
+      } catch (err) {
+        console.error("Error running boredom check:", err);
+      }
+    };
 
-  //Narration Logic
-  const [narrationWords, setNarrationWords] = useState<string[]>([]);
-  const [currentWordIndex, setCurrentWordIndex] = useState<number>(-1);
-  const currentSlide = FetchData[currentSlideIndex] || FetchData[0];
-  const answer = currentSlide.assessment.multiple_choice.choices;
-  const question = currentSlide.assessment.multiple_choice.question;
-  const correctAnswerIndex =
-    currentSlide.assessment.multiple_choice.correct_index;
+    const interval = setInterval(checkBoredom, 10000);
+    return () => clearInterval(interval);
+  }, [loading, showBoredomOverlay, currentSlide]);
 
-  function handleAnswerClick(currIndex: number) {
+
+
+  async function handleAnswerClick(currIndex: number) {
     setSelectedAnswerIndex(currIndex);
     setHasAnswered(true);
+
+    const isCorrect = currIndex === correctAnswerIndex;
+
+    try {
+      // Award XP delta: +15 XP for correct answer, +0 XP for incorrect answer
+      const xpPromise = authFetch(`${BACKEND_URL}/api/profile/xp`, {
+        method: "POST",
+        body: JSON.stringify({
+          xp_delta: isCorrect ? 15 : 0,
+          source_type: isCorrect ? "quiz_correct" : "quiz_incorrect"
+        })
+      });
+
+      const milestonePromise = authFetch(`${BACKEND_URL}/api/milestones`, {
+        method: "POST",
+        body: JSON.stringify({
+          milestone_type: isCorrect ? "biggest_win" : "failed_concept",
+          concept_id: currentSlide.title,
+          description: isCorrect
+            ? "Correct answer on assessment"
+            : "Incorrect answer on assessment",
+          associated_sentiment: isCorrect ? 0.8 : -0.3,
+          mastery_delta: isCorrect ? 0.2 : -0.1,
+        }),
+      });
+
+      const companionPromise = authFetch(`${BACKEND_URL}/api/world/companion`, {
+        method: "POST",
+        body: JSON.stringify({
+          relationship_delta: isCorrect ? 2 : -1,
+        }),
+      });
+
+      const [xpRes] = await Promise.all([xpPromise, milestonePromise, companionPromise]);
+      
+      if (xpRes && xpRes.ok) {
+        const xpData = await xpRes.json();
+        if (xpData.total_xp !== undefined) {
+          setTotalXP(xpData.total_xp);
+          setUserLevel(xpData.level || Math.floor(xpData.total_xp / 100) + 1);
+        }
+      }
+
+      // If user is in a lobby and answers correctly, damage boss HP in Firestore
+      if (isCorrect && currentLobbyId) {
+        try {
+          const lobbyRef = doc(db, "lobbies", currentLobbyId);
+          await updateDoc(lobbyRef, {
+            bossHp: increment(-10)
+          });
+        } catch (lobbyHpErr) {
+          console.error("Error updating boss HP:", lobbyHpErr);
+        }
+      }
+
+      // If correct (milestone / biggest win), award milestone completion +50 XP
+      if (isCorrect) {
+        try {
+          const milestoneXpRes = await authFetch(`${BACKEND_URL}/api/profile/xp`, {
+            method: "POST",
+            body: JSON.stringify({
+              xp_delta: 50,
+              source_type: "milestone_completion"
+            })
+          });
+          if (milestoneXpRes && milestoneXpRes.ok) {
+            const mXpData = await milestoneXpRes.json();
+            if (mXpData.total_xp !== undefined) {
+              setTotalXP(mXpData.total_xp);
+              setUserLevel(mXpData.level || Math.floor(mXpData.total_xp / 100) + 1);
+            }
+          }
+        } catch (mXpErr) {
+          console.error("Error awarding milestone completion XP:", mXpErr);
+        }
+      }
+
+      loadWorldState();
+      fetchLeaderboardAndXP();
+      console.log("Recorded answer outcome, updated companion status, and added XP.");
+    } catch (err) {
+      console.error("Error updating milestone/companion stats and XP:", err);
+    }
   }
 
   function handleNextSlide() {
@@ -367,6 +727,8 @@ const LearningPage = () => {
       murfAudioRef.current.removeEventListener("timeupdate", () => {});
       murfAudioRef.current = null;
     }
+    window.speechSynthesis.cancel();
+    setIsAudioPlaying(false);
     setCurrentWordIndex(-1);
   };
 
@@ -449,13 +811,101 @@ const LearningPage = () => {
     let audio: HTMLAudioElement | null = null;
     let timeUpdateHandler: ((event: Event) => void) | null = null;
 
-    async function fetchAndPlayMurfAudio() {
+    async function fetchAndPlayAudio() {
       // Stop any existing audio before starting new one
       stopAllAudio();
 
-      try {
-        const textToNarrate = translatedNarration || currentSlide.narration;
+      const textToNarrate = translatedNarration || currentSlide.narration;
+      if (!textToNarrate) return;
 
+      // Tier 1: ElevenLabs High-Fidelity Spark Voice
+      if (audioProvider === "elevenlabs") {
+        try {
+          console.log("Playing narration with ElevenLabs...");
+          const firstRegion = worldState?.unlocked_regions?.[0] || "";
+          let companionType = "Spark Owl";
+          if (firstRegion.toLowerCase().includes("numbers") || firstRegion.toLowerCase().includes("valley")) {
+            companionType = "Spark Owl";
+          } else if (firstRegion.toLowerCase().includes("spire") || firstRegion.toLowerCase().includes("starry")) {
+            companionType = "Ember Dragon";
+          } else if (firstRegion.toLowerCase().includes("reef") || firstRegion.toLowerCase().includes("chromatic")) {
+            companionType = "Aqua Mermaid";
+          }
+
+          const response = await authFetch(
+            `${BACKEND_URL}/api/narrate-elevenlabs`,
+            {
+              method: "POST",
+              body: JSON.stringify({
+                text: textToNarrate,
+                companionType: companionType,
+              }),
+            }
+          );
+
+          if (cancelled) return;
+
+          if (!response.ok) {
+            throw new Error(`ElevenLabs error: ${response.status}`);
+          }
+
+          const data = await response.json();
+          if (data.audioUrl) {
+            audio = new Audio(data.audioUrl);
+            murfAudioRef.current = audio;
+
+            const words = textToNarrate.split(/\s+/);
+            const totalDurationEst = words.length * 400; // 400ms per word estimate
+            const isSilentFallback = data.audioUrl && data.audioUrl.endsWith("silent_placeholder.mp3");
+
+            audio.addEventListener("play", () => {
+              setIsAudioPlaying(true);
+              if (isSilentFallback) {
+                let wordIdx = 0;
+                const timer = setInterval(() => {
+                  if (audio && !audio.paused && !cancelled && wordIdx < words.length) {
+                    setCurrentWordIndex(wordIdx);
+                    wordIdx++;
+                  } else {
+                    clearInterval(timer);
+                    setIsAudioPlaying(false);
+                    setCurrentWordIndex(-1);
+                  }
+                }, 400);
+              } else {
+                const timer = setInterval(() => {
+                  if (audio && !audio.paused && !cancelled) {
+                    const estIndex = Math.floor((audio.currentTime / (audio.duration || (totalDurationEst / 1000))) * words.length);
+                    setCurrentWordIndex(Math.min(words.length - 1, estIndex));
+                  } else {
+                    clearInterval(timer);
+                  }
+                }, 100);
+              }
+            });
+
+            audio.addEventListener("ended", () => {
+              if (!isSilentFallback) {
+                setIsAudioPlaying(false);
+                setCurrentWordIndex(-1);
+              }
+            });
+
+            audio.addEventListener("pause", () => {
+              setIsAudioPlaying(false);
+            });
+
+            await audio.play();
+            return; // Success, exit
+          }
+        } catch (e) {
+          console.warn("ElevenLabs failed, falling back to Murf:", e);
+        }
+      }
+
+      // Tier 2: Murf Audio Translation Flow
+      try {
+        console.log("Playing narration with Murf...");
         const response = await authFetch(
           `${BACKEND_URL}/api/generate-speech`,
           {
@@ -473,7 +923,7 @@ const LearningPage = () => {
         if (cancelled) return;
 
         if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+          throw new Error(`Murf error: ${response.status}`);
         }
 
         const data = await response.json();
@@ -488,7 +938,6 @@ const LearningPage = () => {
           audio = new Audio(audioUrl);
           murfAudioRef.current = audio;
 
-          // Create time update handler
           timeUpdateHandler = () => {
             if (!audio) return;
             const currentTime = audio.currentTime;
@@ -501,9 +950,14 @@ const LearningPage = () => {
           };
 
           audio.addEventListener("timeupdate", timeUpdateHandler);
-
-          // Add ended event listener to reset word index
+          audio.addEventListener("play", () => {
+            setIsAudioPlaying(true);
+          });
+          audio.addEventListener("pause", () => {
+            setIsAudioPlaying(false);
+          });
           audio.addEventListener("ended", () => {
+            setIsAudioPlaying(false);
             setCurrentWordIndex(-1);
           });
 
@@ -523,16 +977,44 @@ const LearningPage = () => {
               once: true,
             });
           });
+          return; // Success, exit
         }
-      } catch (e: unknown) {
-        if (!cancelled) {
-          console.error("Failed to fetch narration audio from Murf:", e);
+      } catch (e) {
+        console.warn("Murf failed, falling back to Browser TTS:", e);
+      }
+
+      // Tier 3: Browser Web SpeechSynthesis Fallback
+      if (!cancelled) {
+        try {
+          console.log("Playing narration with browser SpeechSynthesis...");
+          const utterance = new SpeechSynthesisUtterance(textToNarrate);
+          utterance.onstart = () => {
+            setIsAudioPlaying(true);
+          };
+          utterance.onend = () => {
+            setIsAudioPlaying(false);
+            setCurrentWordIndex(-1);
+          };
+          utterance.onerror = () => {
+            setIsAudioPlaying(false);
+            setCurrentWordIndex(-1);
+          };
+          utterance.onboundary = (event) => {
+            if (event.name === "word") {
+              const charIndex = event.charIndex;
+              const wordsBefore = textToNarrate.substring(0, charIndex).trim().split(/\s+/);
+              setCurrentWordIndex(wordsBefore.length - 1);
+            }
+          };
+          window.speechSynthesis.speak(utterance);
+        } catch (e) {
+          console.error("All text-to-speech options failed:", e);
         }
       }
     }
 
     const textToUse = translatedNarration || currentSlide.narration;
-    if (textToUse) fetchAndPlayMurfAudio();
+    if (textToUse) fetchAndPlayAudio();
 
     return () => {
       cancelled = true;
@@ -549,8 +1031,9 @@ const LearningPage = () => {
         murfAudioRef.current.currentTime = 0;
         murfAudioRef.current = null;
       }
+      window.speechSynthesis.cancel();
     };
-  }, [currentSlide.narration, translatedNarration, selectedLanguage]);
+  }, [currentSlide.narration, translatedNarration, selectedLanguage, audioProvider]);
 
   const handleInitiateCall = async () => {
     setIsCallLoading(true);
@@ -671,7 +1154,370 @@ const LearningPage = () => {
 
   return (
     <>
-      <div className="relative flex flex-col items-center justify-center w-full min-h-screen bg-black p-4 md:p-8">
+      <style>{`
+        @keyframes wave-bar {
+          0%, 100% { transform: scaleY(0.3); }
+          50% { transform: scaleY(1.0); }
+        }
+        .animate-wave-bar {
+          animation: wave-bar 1s ease-in-out infinite;
+          transform-origin: bottom;
+        }
+        .animate-wave-bar-1 { animation-delay: 0.1s; }
+        .animate-wave-bar-2 { animation-delay: 0.3s; }
+        .animate-wave-bar-3 { animation-delay: 0.5s; }
+        .animate-wave-bar-4 { animation-delay: 0.2s; animation-duration: 0.7s; }
+        .animate-wave-bar-5 { animation-delay: 0.4s; }
+      `}</style>
+      <div className="min-h-screen w-full bg-black text-white flex flex-col lg:flex-row">
+        {/* Dimension Continuity Dashboard Sidebar */}
+        <div className="hidden lg:flex flex-col w-80 bg-zinc-900/30 backdrop-blur-md border-r border-white/10 p-6 flex-shrink-0 select-none overflow-y-auto space-y-6">
+          {/* Header */}
+          <div className="flex items-center gap-3 border-b border-white/15 pb-4">
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-500 via-purple-500 to-pink-500 flex items-center justify-center shadow-lg shadow-indigo-500/20">
+              <Sparkles className="w-5 h-5 text-white" />
+            </div>
+            <div>
+              <h2 className="text-lg font-bold bg-gradient-to-r from-indigo-400 via-purple-400 to-pink-400 bg-clip-text text-transparent">
+                Cosmos Dashboard
+              </h2>
+              <p className="text-xs text-neutral-400 font-mono">
+                Seed: #{worldState?.world_seed ?? "4091-ALPHA"}
+              </p>
+            </div>
+          </div>
+
+          {/* XP Progress & Level Display */}
+          <div className="space-y-3">
+            <div className="flex justify-between items-end">
+              <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Learning Level</span>
+              <span className="text-xs font-bold text-purple-400">Level {userLevel}</span>
+            </div>
+            <div className="p-3.5 bg-white/5 border border-white/10 rounded-xl space-y-2">
+              <div className="flex justify-between text-xs">
+                <span className="text-neutral-400">Total XP</span>
+                <span className="text-neutral-200 font-semibold">{totalXP} XP</span>
+              </div>
+              <div className="h-2 w-full bg-white/10 rounded-full overflow-hidden">
+                <div
+                  style={{ width: `${totalXP % 100}%` }}
+                  className="h-full bg-gradient-to-r from-purple-500 to-pink-500 rounded-full transition-all duration-500"
+                />
+              </div>
+              <p className="text-[10px] text-neutral-400 text-right">
+                {100 - (totalXP % 100)} XP to Next Level
+              </p>
+            </div>
+          </div>
+
+          {/* Leaderboard Accordion Widget */}
+          <div className="space-y-2">
+            <button
+              onClick={() => setIsLeaderboardOpen(!isLeaderboardOpen)}
+              className="w-full flex justify-between items-center text-[10px] font-bold text-neutral-500 uppercase tracking-widest hover:text-neutral-300 transition-colors"
+            >
+              <span>🏆 Global Leaderboard</span>
+              <FiChevronDown
+                className={`w-3.5 h-3.5 transition-transform duration-200 ${
+                  isLeaderboardOpen ? "rotate-180" : ""
+                }`}
+              />
+            </button>
+            {isLeaderboardOpen && (
+              <div className="bg-white/5 border border-white/10 rounded-xl overflow-hidden divide-y divide-white/5 max-h-60 overflow-y-auto scrollbar-thin scrollbar-thumb-white/10">
+                {leaderboard.length > 0 ? (
+                  leaderboard.map((player: any, idx: number) => {
+                    const isCurrentUser = player.user_id === getCurrentUserId();
+                    return (
+                      <div
+                        key={idx}
+                        className={`flex items-center justify-between p-2 px-3 text-xs transition-colors ${
+                          isCurrentUser
+                            ? "bg-purple-500/10 text-purple-200"
+                            : "text-neutral-300 hover:bg-white/5"
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className={`font-bold w-4 text-center ${
+                            player.rank === 1 ? "text-amber-400" :
+                            player.rank === 2 ? "text-slate-300" :
+                            player.rank === 3 ? "text-amber-600" : "text-neutral-500"
+                          }`}>
+                            {player.rank}
+                          </span>
+                          <span className="truncate max-w-[120px] font-mono">
+                            {player.user_id === "defaultUser" ? "You (Default)" : player.user_id.slice(0, 8)}
+                          </span>
+                        </div>
+                        <span className="font-semibold text-neutral-400">{player.score} XP</span>
+                      </div>
+                    );
+                  })
+                ) : (
+                  <div className="p-3 text-center text-neutral-500 text-xs">
+                    No leaderboard data
+                  </div>
+                )}
+                {userRank > 0 && !leaderboard.some(p => p.user_id === getCurrentUserId()) && (
+                  <div className="flex items-center justify-between p-2 px-3 bg-purple-500/10 text-purple-200 text-xs font-semibold">
+                    <div className="flex items-center gap-2">
+                      <span className="w-4 text-center">#{userRank}</span>
+                      <span>You</span>
+                    </div>
+                    <span>{totalXP} XP</span>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Co-op & Social Hub Accordion Widget */}
+          <div className="space-y-2">
+            <button
+              onClick={() => setIsLobbyPanelOpen(!isLobbyPanelOpen)}
+              className="w-full flex justify-between items-center text-[10px] font-bold text-neutral-500 uppercase tracking-widest hover:text-neutral-300 transition-colors"
+            >
+              <span>🤝 Co-op & Social Hub</span>
+              <FiChevronDown
+                className={`w-3.5 h-3.5 transition-transform duration-200 ${
+                  isLobbyPanelOpen ? "rotate-180" : ""
+                }`}
+              />
+            </button>
+            {isLobbyPanelOpen && (
+              <div className="p-3 bg-white/5 border border-white/10 rounded-xl space-y-3 max-h-[22rem] overflow-y-auto scrollbar-thin scrollbar-thumb-white/10 text-xs">
+                <div className="flex items-center gap-1.5 text-neutral-400">
+                  <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+                  <span className="font-semibold">{onlinePeers.length + 1} online peer(s)</span>
+                </div>
+
+                {!currentLobbyId ? (
+                  <div className="space-y-3">
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-neutral-500 font-bold uppercase">Create Study Lobby</label>
+                      <div className="flex gap-1.5">
+                        <input
+                          type="text"
+                          value={newLobbyName}
+                          onChange={(e) => setNewLobbyName(e.target.value)}
+                          placeholder="Lobby name..."
+                          className="flex-1 bg-white/5 border border-white/15 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-white/30"
+                        />
+                        <button
+                          onClick={createLobby}
+                          disabled={!newLobbyName.trim()}
+                          className="px-3 py-1.5 bg-white text-black hover:bg-neutral-200 disabled:opacity-50 font-bold rounded-lg cursor-pointer transition-colors"
+                        >
+                          Create
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="space-y-2">
+                      <label className="text-[10px] text-neutral-500 font-bold uppercase block">Active Lobbies</label>
+                      {lobbies.length > 0 ? (
+                        <div className="space-y-1.5">
+                          {lobbies.map((lobby) => (
+                            <div key={lobby.id} className="flex justify-between items-center p-2 bg-white/5 border border-white/5 rounded-lg">
+                              <div>
+                                <p className="font-semibold text-neutral-200 truncate max-w-[120px]">{lobby.name}</p>
+                                <p className="text-[9px] text-neutral-400">{lobby.members?.length || 0} studying</p>
+                              </div>
+                              <button
+                                onClick={() => joinLobby(lobby.id)}
+                                className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-500 rounded text-[10px] font-bold text-white transition-colors cursor-pointer"
+                              >
+                                Join
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="text-[10px] text-neutral-500 italic">No active lobbies. Create one to study together!</p>
+                      )}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="flex justify-between items-center border-b border-white/10 pb-2">
+                      <p className="font-bold text-indigo-400 truncate max-w-[140px] text-sm">{lobbyState?.name}</p>
+                      <button
+                        onClick={leaveLobby}
+                        className="text-[10px] font-semibold text-red-400 hover:text-red-300 transition-colors"
+                      >
+                        Leave
+                      </button>
+                    </div>
+
+                    <div className="p-2.5 bg-white/5 border border-white/10 rounded-lg space-y-2">
+                      <div className="flex justify-between items-center">
+                        <span className="font-bold text-neutral-200">👹 {lobbyState?.bossName}</span>
+                        <span className="text-[10px] text-neutral-400">{lobbyState?.bossHp} / {lobbyState?.bossMaxHp} HP</span>
+                      </div>
+                      <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden">
+                        <div
+                          style={{ width: `${Math.max(0, (lobbyState?.bossHp || 0))}%` }}
+                          className={`h-full rounded-full transition-all duration-300 ${
+                            lobbyState?.status === "defeated" ? "bg-emerald-500" : "bg-gradient-to-r from-red-500 to-orange-500"
+                          }`}
+                        />
+                      </div>
+                      <p className="text-[9px] text-neutral-400 leading-relaxed">
+                        {lobbyState?.status === "defeated"
+                          ? "🎉 Defeated! +100 XP awarded to all."
+                          : "⚔ Correct answers damage the boss!"}
+                      </p>
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="text-[10px] text-neutral-500 font-bold uppercase">Lobby Chat</label>
+                      <div className="bg-black/20 border border-white/5 rounded-lg p-2 h-24 overflow-y-auto space-y-1.5 scrollbar-thin scrollbar-thumb-white/10 flex flex-col">
+                        {chatMessages.length > 0 ? (
+                          chatMessages.map((msg) => {
+                            const isMe = msg.senderId === getCurrentUserId();
+                            return (
+                              <div key={msg.id} className={`flex flex-col ${isMe ? "items-end" : "items-start"}`}>
+                                <span className="text-[8px] text-neutral-500 font-mono">
+                                  {isMe ? "You" : msg.senderId.slice(0, 6)}
+                                </span>
+                                <span className={`px-2 py-1 rounded-lg max-w-[90%] break-words inline-block text-[10px] ${
+                                  isMe ? "bg-indigo-600 text-white" : "bg-white/10 text-neutral-300"
+                                }`}>
+                                  {msg.text}
+                                </span>
+                              </div>
+                            );
+                          })
+                        ) : (
+                          <p className="text-[9px] text-neutral-500 italic m-auto">No messages. Say hello!</p>
+                        )}
+                      </div>
+                      <div className="flex gap-1">
+                        <input
+                          type="text"
+                          value={typedMessage}
+                          onChange={(e) => setTypedMessage(e.target.value)}
+                          onKeyDown={(e) => e.key === "Enter" && sendChatMessage()}
+                          placeholder="Send message..."
+                          className="flex-1 bg-white/5 border border-white/10 rounded-lg px-2 py-1 text-xs text-white focus:outline-none focus:border-white/20"
+                        />
+                        <button
+                          onClick={sendChatMessage}
+                          disabled={!typedMessage.trim()}
+                          className="px-2.5 py-1 bg-indigo-600 text-white font-semibold rounded-lg hover:bg-indigo-500 disabled:opacity-50 text-[10px] cursor-pointer"
+                        >
+                          Send
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Active Dimension */}
+          <div className="space-y-2">
+            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Active Dimension</span>
+            <div className="p-3.5 bg-white/5 border border-white/10 rounded-xl flex items-center gap-3">
+              <div className="w-8 h-8 rounded-lg bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center">
+                <span className="text-indigo-400 text-sm">🌌</span>
+              </div>
+              <div>
+                <p className="text-sm font-semibold text-neutral-200">
+                  {worldState?.current_dimension ?? "Ethereal Nexus"}
+                </p>
+                <p className="text-[10px] text-neutral-400 font-medium">Quantum Learning Path</p>
+              </div>
+            </div>
+          </div>
+
+          {/* Companion Affinity Bond */}
+          <div className="space-y-3">
+            <div className="flex justify-between items-end">
+              <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Companion Bond</span>
+              <span className="text-xs font-bold text-indigo-400">{worldState?.companion_relationship_score ?? 15}%</span>
+            </div>
+            <div className="space-y-2">
+              <div className="h-2 w-full bg-white/10 rounded-full overflow-hidden">
+                <div
+                  style={{ width: `${worldState?.companion_relationship_score ?? 15}%` }}
+                  className="h-full bg-gradient-to-r from-indigo-500 to-purple-500 rounded-full transition-all duration-500"
+                />
+              </div>
+              <p className="text-[11px] text-neutral-400 italic">
+                {worldState?.companion_relationship_score >= 80 ? "✨ Inseparable Soulmates" :
+                 worldState?.companion_relationship_score >= 50 ? "🤝 Trusted Companions" :
+                 worldState?.companion_relationship_score >= 25 ? "🌱 Growing Friendship" :
+                 "🤝 Spark is getting to know you"}
+              </p>
+            </div>
+          </div>
+
+          {/* Unlocked Regions */}
+          <div className="space-y-2.5">
+            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Unlocked Regions</span>
+            <div className="space-y-2">
+              {(worldState?.unlocked_regions && worldState.unlocked_regions.length > 0) ? (
+                worldState.unlocked_regions.map((region: string, idx: number) => (
+                  <div key={idx} className="flex items-center gap-2.5 px-3 py-2 bg-white/5 border border-white/5 rounded-lg text-xs text-neutral-300 hover:border-white/10 transition-colors">
+                    <span className="text-emerald-400 text-xs">📍</span>
+                    <span className="font-medium">{region}</span>
+                  </div>
+                ))
+              ) : (
+                <>
+                  <div className="flex items-center gap-2.5 px-3 py-2 bg-white/5 border border-white/5 rounded-lg text-xs text-neutral-300">
+                    <span className="text-emerald-400 text-xs">📍</span>
+                    <span className="font-medium">Cosmic Gateway</span>
+                  </div>
+                  <div className="flex items-center gap-2.5 px-3 py-2 bg-white/5 border border-white/5 rounded-lg text-xs text-neutral-300">
+                    <span className="text-neutral-500 text-xs">📍</span>
+                    <span className="font-medium">Starlight Ridge</span>
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+
+          {/* Lore */}
+          <div className="space-y-2">
+            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Dimension Lore</span>
+            <div className="p-3 bg-white/5 border border-white/10 rounded-xl max-h-36 overflow-y-auto text-xs text-neutral-400 leading-relaxed scrollbar-thin scrollbar-thumb-white/10">
+              {worldState?.world_lore_summary ?? "A floating sanctuary suspended in the quantum matrix, where knowledge translates directly into emotional energy."}
+            </div>
+          </div>
+
+          {/* Voice Settings */}
+          <div className="space-y-2.5 pt-4 border-t border-white/10">
+            <span className="text-[10px] font-bold text-neutral-500 uppercase tracking-widest">Voice Orchestrator</span>
+            <div className="grid grid-cols-2 gap-1.5 p-1 bg-white/5 border border-white/10 rounded-xl">
+              <button
+                onClick={() => setAudioProvider("elevenlabs")}
+                className={`py-1.5 px-2 rounded-lg text-[10px] font-semibold transition-all ${
+                  audioProvider === "elevenlabs"
+                    ? "bg-white text-black shadow-sm"
+                    : "text-neutral-400 hover:text-neutral-200"
+                }`}
+              >
+                ElevenLabs (HQ)
+              </button>
+              <button
+                onClick={() => setAudioProvider("murf")}
+                className={`py-1.5 px-2 rounded-lg text-[10px] font-semibold transition-all ${
+                  audioProvider === "murf"
+                    ? "bg-white text-black shadow-sm"
+                    : "text-neutral-400 hover:text-neutral-200"
+                }`}
+              >
+                Murf AI / TTS
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Main Content Area */}
+        <div className="flex-1 relative flex flex-col items-center justify-center w-full min-h-screen bg-black p-4 md:p-8 overflow-y-auto">
         <div className="z-10 flex mb-8">
           <div
             className={cn(
@@ -757,24 +1603,36 @@ const LearningPage = () => {
               <div className="absolute inset-0 bg-gradient-to-br from-green-500/20 via-emerald-500/20 to-teal-500/20 opacity-0 group-hover:opacity-100 transition-opacity duration-500"></div>
               <div className="absolute inset-0 bg-grid-white/[0.02] bg-[size:20px_20px]"></div>
               <div className="relative z-10 h-full flex flex-col">
-                <div className="flex items-center gap-2 mb-3">
-                  <div className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center">
-                    <svg
-                      xmlns="http://www.w3.org/2000/svg"
-                      fill="white"
-                      viewBox="0 0 24 24"
-                      strokeWidth={1.5}
-                      stroke="white"
-                      className="w-4 h-4"
-                    >
-                      <path
-                        strokeLinecap="round"
-                        strokeLinejoin="round"
-                        d="M19.114 5.636a9 9 0 0 1 0 12.728M16.463 8.288a5.25 5.25 0 0 1 0 7.424M6.75 8.25l4.72-4.72a.75.75 0 0 1 1.28.53v15.88a.75.75 0 0 1-1.28.53l-4.72-4.72H4.51c-.88 0-1.704-.507-1.938-1.354A9.009 9.009 0 0 1 2.25 12c0-.83.112-1.633.322-2.396C2.806 8.756 3.63 8.25 4.51 8.25H6.75Z"
-                      />
-                    </svg>
+                <div className="flex items-center justify-between mb-3">
+                  <div className="flex items-center gap-2">
+                    <div className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center">
+                      <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        fill="white"
+                        viewBox="0 0 24 24"
+                        strokeWidth={1.5}
+                        stroke="white"
+                        className="w-4 h-4"
+                      >
+                        <path
+                          strokeLinecap="round"
+                          strokeLinejoin="round"
+                          d="M19.114 5.636a9 9 0 0 1 0 12.728M16.463 8.288a5.25 5.25 0 0 1 0 7.424M6.75 8.25l4.72-4.72a.75.75 0 0 1 1.28.53v15.88a.75.75 0 0 1-1.28.53l-4.72-4.72H4.51c-.88 0-1.704-.507-1.938-1.354A9.009 9.009 0 0 1 2.25 12c0-.83.112-1.633.322-2.396C2.806 8.756 3.63 8.25 4.51 8.25H6.75Z"
+                        />
+                      </svg>
+                    </div>
+                    <h3 className="text-lg font-medium text-white">Narration</h3>
                   </div>
-                  <h3 className="text-lg font-medium text-white">Narration</h3>
+
+                  {isAudioPlaying && (
+                    <div className="flex items-end gap-[3px] h-4 px-2">
+                      <span className="w-[3px] bg-emerald-400 rounded-full animate-wave-bar animate-wave-bar-1 h-2" />
+                      <span className="w-[3px] bg-emerald-400 rounded-full animate-wave-bar animate-wave-bar-2 h-4" />
+                      <span className="w-[3px] bg-emerald-400 rounded-full animate-wave-bar animate-wave-bar-3 h-3" />
+                      <span className="w-[3px] bg-emerald-400 rounded-full animate-wave-bar animate-wave-bar-4 h-5" />
+                      <span className="w-[3px] bg-emerald-400 rounded-full animate-wave-bar animate-wave-bar-5 h-1.5" />
+                    </div>
+                  )}
                 </div>
                 <motion.div
                   initial={{ opacity: 0 }}
@@ -1253,6 +2111,109 @@ const LearningPage = () => {
             </div>
           </div>
         )}
+
+        {/* Boredom Intervention Overlay */}
+        <AnimatePresence>
+          {showBoredomOverlay && (
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-md p-4"
+            >
+              <motion.div
+                initial={{ scale: 0.9, y: 20 }}
+                animate={{ scale: 1, y: 0 }}
+                exit={{ scale: 0.9, y: 20 }}
+                className="bg-[#0f172a] border border-indigo-500/30 rounded-3xl p-8 max-w-lg w-full shadow-2xl relative"
+              >
+                <div className="flex flex-col items-center text-center">
+                  <div className="w-16 h-16 rounded-full bg-indigo-500 flex items-center justify-center shadow-lg shadow-indigo-500/20 mb-4 animate-bounce">
+                    <Sparkles className="w-8 h-8 text-white" />
+                  </div>
+                  
+                  <h3 className="text-2xl font-bold bg-gradient-to-r from-indigo-400 to-purple-400 bg-clip-text text-transparent mb-2">
+                    Spark wants to check in!
+                  </h3>
+                  
+                  <p className="text-slate-300 text-sm mb-6 leading-relaxed">
+                    "Hey! I noticed your energy levels might be shifting. Let's adjust our session together to keep the magic alive!"
+                  </p>
+
+                  <div className="flex flex-col gap-3 w-full">
+                    <button
+                      onClick={async () => {
+                        setIsUpdatingPacing(true);
+                        try {
+                          const paceUpdate = authFetch(`${BACKEND_URL}/api/profile/update`, {
+                            method: "POST",
+                            body: JSON.stringify({
+                              curiosity_type: "Logical-Explorer",
+                              learning_style: "Visual",
+                              pacing_preference: "slow",
+                              motivation_trigger: "Explorative"
+                            })
+                          });
+
+                          const recoveryMilestone = authFetch(`${BACKEND_URL}/api/milestones`, {
+                            method: "POST",
+                            body: JSON.stringify({
+                              milestone_type: "recovery_milestone",
+                              concept_id: currentSlide.title,
+                              description: "User adjusted learning pacing for recovery",
+                              associated_sentiment: 0.5
+                            })
+                          });
+
+                          const recoveryXP = authFetch(`${BACKEND_URL}/api/profile/xp`, {
+                            method: "POST",
+                            body: JSON.stringify({
+                              xp_delta: 50,
+                              source_type: "recovery_milestone"
+                            })
+                          });
+
+                          await Promise.all([paceUpdate, recoveryMilestone, recoveryXP]);
+                          fetchLeaderboardAndXP();
+                          alert("Pacing slowed down to give you more breathing room! (+50 XP awarded for recovery milestone) 👍");
+                        } catch (e) {
+                          console.error(e);
+                        } finally {
+                          setIsUpdatingPacing(false);
+                          setShowBoredomOverlay(false);
+                        }
+                      }}
+                      disabled={isUpdatingPacing}
+                      className="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-semibold py-3 px-4 rounded-xl transition duration-200 cursor-pointer disabled:opacity-50"
+                    >
+                      {isUpdatingPacing ? "Adjusting..." : "🐢 Slow down the pacing"}
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        setShowBoredomOverlay(false);
+                        navigate("/onboarding");
+                      }}
+                      className="w-full bg-purple-600 hover:bg-purple-500 text-white font-semibold py-3 px-4 rounded-xl transition duration-200 cursor-pointer"
+                    >
+                      🎮 Play a quick game
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        setShowBoredomOverlay(false);
+                      }}
+                      className="w-full bg-slate-800 hover:bg-slate-700 text-white py-3 px-4 rounded-xl transition duration-200 cursor-pointer"
+                    >
+                      No, I'm okay! Keep going
+                    </button>
+                  </div>
+                </div>
+              </motion.div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+        </div>
       </div>
     </>
   );
